@@ -34,6 +34,9 @@ def load_env():
                 key, val = key.strip(), val.strip()
                 if val:
                     values.setdefault(key, val)
+    for k, v in os.environ.items():
+        if v:
+            values[k] = v
     return values
 
 
