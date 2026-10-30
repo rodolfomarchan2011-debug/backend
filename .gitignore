@@ -7,6 +7,8 @@ backups/
 *.db
 *.sqlite
 *.sql
+# schema do banco e codigo (versionar), dumps ficam em backups/
+!sql/schema.sql
 
 # Python
 __pycache__/
