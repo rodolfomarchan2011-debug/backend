@@ -51,7 +51,9 @@ def load_env():
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, val = line.split("=", 1)
-                values.setdefault(key.strip(), val.strip())
+                key, val = key.strip(), val.strip()
+                if val:
+                    values.setdefault(key, val)
     return values
 
 

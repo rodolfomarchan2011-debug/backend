@@ -31,7 +31,9 @@ def load_env():
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, val = line.split("=", 1)
-                values.setdefault(key.strip(), val.strip())
+                key, val = key.strip(), val.strip()
+                if val:
+                    values.setdefault(key, val)
     return values
 
 
@@ -48,13 +50,14 @@ def club_url(env):
 
 def connect(url):
     parsed = urlparse(url)
-    port = parsed.port or 3306
+    port = parsed.port or 4000
     ssl = {"ssl": {}} if port == 4000 else None
     return pymysql.connect(
         host=parsed.hostname,
         port=port,
         user=unquote(parsed.username or ""),
         password=unquote(parsed.password or ""),
+        database=parsed.path.lstrip("/") or "sys",
         connect_timeout=20,
         autocommit=True,
         ssl=ssl,
