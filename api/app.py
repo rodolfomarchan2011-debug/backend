@@ -318,7 +318,7 @@ class Descadastro(BaseModel):
 
 app = FastAPI(
     title="Clube Diana API",
-    version="1.4.0",
+    version="1.5.0",
     docs_url="/docs" if DOCS_ATIVO else None,
     redoc_url="/redoc" if DOCS_ATIVO else None,
     openapi_url="/openapi.json" if DOCS_ATIVO else None,
@@ -450,44 +450,109 @@ def login(body: Login, request: Request):
             "cliente": {"nome": row["nome"], "cpf": row["cpf"]}}
 
 
+def _periodo(de, ate):
+    """Normaliza o filtro de datas (YYYY-MM-DD). Devolve (date|None, date|None)."""
+    def conv(v):
+        if not v:
+            return None
+        try:
+            return datetime.strptime(str(v)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(400, "Data invalida")
+
+    d, a = conv(de), conv(ate)
+    if d and a and d > a:
+        raise HTTPException(400, "Periodo invalido")
+    return d, a
+
+
+def _filtro(where, params, d, a):
+    if d:
+        where += " AND data_venda >= %s"
+        params.append(d)
+    if a:
+        where += " AND data_venda < DATE_ADD(%s, INTERVAL 1 DAY)"
+        params.append(a)
+    return where, params
+
+
 @app.get("/api/me/compras")
-def compras(user=Depends(atual), limit: int = 50):
-    limit = max(1, min(limit, 200))
+def compras(user=Depends(atual), limit: int = 20, offset: int = 0,
+            de: str | None = None, ate: str | None = None):
+    """Historico completo do cliente, com filtro de periodo e paginacao."""
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
+    d, a = _periodo(de, ate)
+    where, params = _filtro("cliente_id=%s", [user["id"]], d, a)
+
     conn = db()
     try:
         with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM compras WHERE " + where, tuple(params))
+            total = int(cur.fetchone()["n"])
             cur.execute(
-                "SELECT data_venda, total_liquido, total_desconto, cupom, itens_json "
-                "FROM compras WHERE cliente_id=%s ORDER BY data_venda DESC LIMIT %s",
-                (user["id"], limit))
+                "SELECT data_venda, total_liquido, total_desconto, cupom "
+                "FROM compras WHERE " + where +
+                " ORDER BY data_venda DESC LIMIT %s OFFSET %s",
+                tuple(params) + (limit, offset))
             rows = cur.fetchall()
     finally:
         conn.close()
+
     for r in rows:
         r["data_venda"] = r["data_venda"].strftime("%d/%m/%Y %H:%M")
         r["total_liquido"] = float(r["total_liquido"] or 0)
         r["total_desconto"] = float(r["total_desconto"] or 0)
-    return {"ok": True, "compras": rows}
+
+    return {"ok": True, "total": total, "offset": offset,
+            "tem_mais": offset + len(rows) < total,
+            "periodo": {"de": d.isoformat() if d else None,
+                        "ate": a.isoformat() if a else None},
+            "compras": rows}
 
 
 @app.get("/api/me/resumo")
-def resumo(user=Depends(atual)):
+def resumo(user=Depends(atual), de: str | None = None, ate: str | None = None):
+    """Totais do periodo (padrao: tudo) + totais de vida do cliente."""
+    d, a = _periodo(de, ate)
+    where, params = _filtro("cliente_id=%s", [user["id"]], d, a)
+
     conn = db()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) AS qtd, COALESCE(SUM(total_liquido),0) AS gasto, "
                 "COALESCE(SUM(total_desconto),0) AS economia, MAX(data_venda) AS ultima "
-                "FROM compras WHERE cliente_id=%s", (user["id"],))
+                "FROM compras WHERE " + where, tuple(params))
             r = cur.fetchone()
-            cur.execute("SELECT nome,cpf FROM clientes WHERE id=%s", (user["id"],))
+            cur.execute(
+                "SELECT COUNT(*) AS qtd, COALESCE(SUM(total_liquido),0) AS gasto, "
+                "COALESCE(SUM(total_desconto),0) AS economia, "
+                "MIN(data_venda) AS primeira, MAX(data_venda) AS ultima "
+                "FROM compras WHERE cliente_id=%s", (user["id"],))
+            g = cur.fetchone()
+            cur.execute("SELECT nome,cpf,criado_em FROM clientes WHERE id=%s", (user["id"],))
             c = cur.fetchone() or {}
     finally:
         conn.close()
-    return {"ok": True, "cliente": c, "compras": int(r["qtd"]),
+
+    def br(dt):
+        return dt.strftime("%d/%m/%Y") if dt else None
+
+    return {"ok": True,
+            "cliente": {"nome": c.get("nome"), "cpf": c.get("cpf"),
+                        "desde": br(c.get("criado_em"))},
+            "periodo": {"de": d.isoformat() if d else None,
+                        "ate": a.isoformat() if a else None},
+            "compras": int(r["qtd"]),
             "total_gasto": float(r["gasto"] or 0),
             "total_economizado": float(r["economia"] or 0),
-            "ultima_compra": r["ultima"].strftime("%d/%m/%Y") if r["ultima"] else None}
+            "ultima_compra": br(r["ultima"]),
+            "geral": {"compras": int(g["qtd"]),
+                      "total_gasto": float(g["gasto"] or 0),
+                      "total_economizado": float(g["economia"] or 0),
+                      "primeira_compra": br(g["primeira"]),
+                      "ultima_compra": br(g["ultima"])}}
 
 
 @app.get("/api/me/dados")

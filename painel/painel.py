@@ -23,6 +23,8 @@ from datetime import datetime
 from urllib.parse import urlparse, unquote
 
 import pymysql
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -73,6 +75,38 @@ def conn():
     )
 
 
+def sim_conn():
+    """Conexao somente leitura com o PDV (SIM)."""
+    url = ENV.get("DIANA_SIM_VIVO_DATABASE_URL") or ENV.get("DIANA_SIM_DATABASE_URL")
+    if not url:
+        raise HTTPException(503, "SIM nao configurado (DIANA_SIM_VIVO_DATABASE_URL)")
+    conn = psycopg2.connect(url, connect_timeout=10, options="-c statement_timeout=20000")
+    conn.set_session(readonly=True, autocommit=True)
+    return conn
+
+
+SQL_ADESAO = """
+WITH base AS (
+  SELECT l."DataLancamento" AS dt,
+         COALESCE(
+           NULLIF(regexp_replace(COALESCE(p."Documento",''),'\\D','','g'),''),
+           NULLIF(regexp_replace(COALESCE(v."Documento",''),'\\D','','g'),'')
+         ) AS cpf
+  FROM "Venda" v
+  JOIN "Lancamento" l ON l."Id" = v."LancamentoId"
+  LEFT JOIN "Cliente" c ON c."Id" = v."ClienteId"
+  LEFT JOIN "Pessoa" p ON p."Id" = c."PessoaId"
+  WHERE l."DataLancamento" >= now() - make_interval(days => %s)
+)
+SELECT to_char(dt::date, 'DD/MM') AS dia,
+       count(*) AS vendas,
+       sum(CASE WHEN COALESCE(cpf,'') <> '' THEN 1 ELSE 0 END) AS com_cpf
+FROM base
+GROUP BY dt::date
+ORDER BY dt::date
+"""
+
+
 def cpf_valido(cpf):
     if len(cpf) != 11 or cpf == cpf[0] * 11:
         return False
@@ -106,6 +140,33 @@ def backups():
 
 
 app = FastAPI(title="Painel Clube Diana", docs_url=None, redoc_url=None)
+
+
+@app.get("/api/adesao")
+def adesao(dias: int = 7):
+    dias = max(1, min(int(dias), 90))
+    try:
+        conn = sim_conn()
+    except HTTPException as erro:
+        return {"ok": False, "erro": erro.detail}
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(SQL_ADESAO, (dias,))
+            linhas = cur.fetchall()
+    except Exception as exc:
+        return {"ok": False, "erro": type(exc).__name__}
+    finally:
+        conn.close()
+
+    total_v = sum(int(r["vendas"]) for r in linhas)
+    total_c = sum(int(r["com_cpf"]) for r in linhas)
+    return {
+        "ok": True,
+        "dias": [{"dia": r["dia"], "vendas": int(r["vendas"]), "com_cpf": int(r["com_cpf"])}
+                 for r in linhas],
+        "total": {"vendas": total_v, "com_cpf": total_c,
+                  "pct": round(100.0 * total_c / total_v, 1) if total_v else 0},
+    }
 
 
 class Id(BaseModel):
@@ -313,6 +374,17 @@ HTML = """<!doctype html>
   dialog::backdrop{background:rgba(0,0,0,.4)}
   dialog h3{margin-top:0}
   .erro-linha{color:var(--vermelho);font-size:12px;margin-top:6px}
+  .secao{font-size:15px;margin:26px 0 4px}
+  .dica{font-size:12px;color:#8a7b69;margin:0 0 12px;max-width:720px}
+  .adesao{background:#fff;border:1px solid var(--linha);border-radius:12px;padding:14px 16px}
+  .adesao .totais{font-size:13px;margin-bottom:10px}
+  .adesao .totais b{font-size:20px}
+  .barra-dia{display:flex;align-items:center;gap:10px;margin:6px 0;font-size:12px}
+  .barra-dia .dia{width:52px;color:#7a6b59}
+  .barra-dia .trilho{flex:1;height:10px;background:#f1e7d8;border-radius:99px;overflow:hidden}
+  .barra-dia .trilho i{display:block;height:100%;background:#a4161a}
+  .barra-dia .trilho i.ok{background:#2e7d32}
+  .barra-dia .num{width:130px;text-align:right;color:#7a6b59}
 </style>
 </head>
 <body>
@@ -348,6 +420,10 @@ HTML = """<!doctype html>
     </thead>
     <tbody id="linhas"><tr><td colspan="5">carregando...</td></tr></tbody>
   </table>
+
+  <h2 class="secao">Adesao do CPF no caixa</h2>
+  <p class="dica">Vendas em que o caixa identificou o cliente. Se o operador nao escolhe o cliente (ou digita o CPF), a compra nao aparece no painel do cliente.</p>
+  <div id="adesao" class="adesao">carregando...</div>
 
   <div class="rodape">
     <span id="f-tarefa">tarefa: -</span>
@@ -497,8 +573,30 @@ $("btn-backups").addEventListener("click", function () {
     .then(function (d) { if (!d.ok) alert(d.mensagem); });
 });
 
+function carregarAdesao() {
+  fetch("/api/adesao?dias=7").then(function (r) { return r.json(); }).then(function (d) {
+    var alvo = document.getElementById("adesao");
+    if (!d.ok) { alvo.textContent = "Nao foi possivel ler o PDV agora (" + (d.erro || "erro") + ")."; return; }
+    var pct = d.total.pct;
+    var cor = pct >= 70 ? "ok" : "";
+    var html = "<div class='totais'>Ultimos 7 dias: <b>" + pct + "%</b> das vendas com CPF " +
+      "(" + d.total.com_cpf + " de " + d.total.vendas + ")</div>";
+    d.dias.forEach(function (dia) {
+      var p = dia.vendas ? Math.round(1000 * dia.com_cpf / dia.vendas) / 10 : 0;
+      html += "<div class='barra-dia'><span class='dia'>" + dia.dia + "</span>" +
+        "<div class='trilho'><i class='" + (p >= 70 ? "ok" : "") + "' style='width:" + p + "%'></i></div>" +
+        "<span class='num'>" + p + "% (" + dia.com_cpf + "/" + dia.vendas + ")</span></div>";
+    });
+    alvo.innerHTML = html;
+  }).catch(function () {
+    document.getElementById("adesao").textContent = "Sem conexao com o PDV.";
+  });
+}
+
 carregar();
+carregarAdesao();
 setInterval(carregar, 30000);
+setInterval(carregarAdesao, 60000);
 </script>
 </body>
 </html>
