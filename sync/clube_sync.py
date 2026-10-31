@@ -9,19 +9,24 @@ Seguranca (mesmo padrao do financeiro):
   - SIM escrita: usuario restrito, SOMENTE INSERT em Pessoa/Cliente.
   - Nunca DELETE/TRUNCATE/ALTER. Idempotente (uuid5 por CPF/venda).
   - Dedup por CPF: reaproveita Pessoa/Cliente ja existentes no SIM.
+  - Guarda de nome: se o CPF ja existe no SIM com OUTRO primeiro nome,
+    NAO vincula (evita juntar duas pessoas e vazar compras). Fica como
+    erro para a loja revisar; use --forcar quando for a mesma pessoa.
   - Backup JSON antes de escrever no SIM.
-  - Logs apenas com contagens (nunca CPF/nome).
+  - Logs apenas com contagens (nunca CPF/nome) no log do agente.
 
 Uso:
   python sync/clube_sync.py --all
-  python sync/clube_sync.py --push-cadastros [--dry-run]
-  python sync/clube_sync.py --pull-compras   [--dry-run]
+  python sync/clube_sync.py --push-cadastros [--dry-run] [--cpf 000.000.000-00] [--forcar]
+  python sync/clube_sync.py --pull-compras   [--dry-run] [--dias 90]
+  python sync/clube_sync.py --status
 """
 import argparse
 import json
 import os
 import re
 import sys
+import time
 import uuid
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, urlunparse, unquote
@@ -34,8 +39,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_CANDIDATES = [
     os.path.join(ROOT, ".env"),
     os.path.join(ROOT, "..", "IA TELEGRAM", ".env"),
+    os.path.join(ROOT, "..", "..", "IA TELEGRAM", ".env"),
 ]
 BACKUP_DIR = os.path.join(ROOT, "backups")
+LOG_DIR = os.path.join(ROOT, "logs")
+LOG_PATH = os.path.join(LOG_DIR, "sync.log")
+LOCK_PATH = os.path.join(LOG_DIR, ".sync.lock")
 MAX_TENTATIVAS = 8
 NS = uuid.UUID("6f1c2d3e-4a5b-4c6d-8e7f-90a1b2c3d4e5")
 
@@ -51,13 +60,48 @@ def load_env():
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, val = line.split("=", 1)
-                key, val = key.strip(), val.strip()
+                key, val = key.strip(), val.strip().strip('"').strip("'")
                 if val:
                     values.setdefault(key, val)
     for k, v in os.environ.items():
         if v:
             values[k] = v
     return values
+
+
+def log(msg):
+    """Grava no logs/sync.log e mostra na tela (sem dados pessoais)."""
+    linha = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
+    print(msg)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        if os.path.isfile(LOG_PATH) and os.path.getsize(LOG_PATH) > 2_000_000:
+            os.replace(LOG_PATH, LOG_PATH + ".1")
+        with open(LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(linha + "\n")
+    except OSError:
+        pass
+
+
+def pegar_lock():
+    """Impede duas execucoes ao mesmo tempo (agendador + clique manual)."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    if os.path.isfile(LOCK_PATH):
+        idade = time.time() - os.path.getmtime(LOCK_PATH)
+        if idade < 1800:
+            log(f"[lock] outra execucao em andamento ({int(idade // 60)} min). Saindo.")
+            return False
+        log("[lock] lock antigo encontrado, seguindo.")
+    with open(LOCK_PATH, "w", encoding="utf-8") as fh:
+        fh.write(str(os.getpid()))
+    return True
+
+
+def soltar_lock():
+    try:
+        os.remove(LOCK_PATH)
+    except OSError:
+        pass
 
 
 def club_url(env):
@@ -73,7 +117,9 @@ def sim_read_url(env):
     for key in ("DIANA_SIM_VIVO_DATABASE_URL", "DIANA_SIM_DATABASE_URL", "SIM_LEITURA_URL"):
         if env.get(key):
             return env[key]
-    sys.exit("Sem URL de leitura do SIM (DIANA_SIM_VIVO_DATABASE_URL)")
+    log("[erro] sem URL de leitura do SIM (DIANA_SIM_VIVO_DATABASE_URL). "
+        "Confira o .env da pasta 'IA TELEGRAM'.")
+    sys.exit(2)
 
 
 def mysql_conn(url):
@@ -113,39 +159,62 @@ def backup(records):
     return path
 
 
+def primeiro_nome(nome):
+    partes = [p for p in re.split(r"\s+", (nome or "").strip().upper()) if p]
+    return partes[0] if partes else ""
+
+
+def conflito_de_nome(nome_clube, nome_sim):
+    """True quando o CPF do clube aponta para OUTRA pessoa no SIM."""
+    a, b = primeiro_nome(nome_clube), primeiro_nome(nome_sim)
+    if not a or not b or a == b:
+        return False
+    # aceita variacao por abreviacao (JOSE / J., MARIA / MARIANA)
+    if a.startswith(b) or b.startswith(a) or a[:3] == b[:3]:
+        return False
+    return True
+
+
 # ------------------------------------------------------------------
 # 1) CLUBE -> SIM  (Pessoa + Cliente)
 # ------------------------------------------------------------------
-def push_cadastros(env, dry_run):
+def push_cadastros(env, dry_run, cpf_filtro=None, forcar=False):
     write_url = env.get("DIANA_SIM_ESCRITA_URL")
     if not write_url:
-        print("[push] DIANA_SIM_ESCRITA_URL ausente: escrita no SIM desativada.")
-        return
+        log("[push] DIANA_SIM_ESCRITA_URL ausente: escrita no SIM desativada.")
+        return 1
 
     my = mysql_conn(club_url(env))
     pg = pg_conn(write_url, readonly=False)
     pending, write_plan, done, errors = [], [], 0, 0
 
+    sql = ("SELECT id, nome, cpf, telefone, data_nascimento, sim_pessoa_id, sim_cliente_id "
+           "FROM clientes "
+           "WHERE sim_cliente_id IS NULL AND sync_tentativas < %s "
+           "AND (sync_status = 'pendente' OR sync_status = 'erro') "
+           "AND excluido_em IS NULL")
+    params = [MAX_TENTATIVAS]
+    if cpf_filtro:
+        sql += " AND cpf = %s"
+        params.append(cpf_filtro)
+    sql += " ORDER BY criado_em LIMIT 50"
+
     try:
         with my.cursor() as cur:
-            cur.execute(
-                "SELECT id, nome, cpf, telefone, data_nascimento, sim_pessoa_id, sim_cliente_id "
-                "FROM clientes "
-                "WHERE sim_cliente_id IS NULL AND sync_tentativas < %s "
-                "AND (sync_status = 'pendente' OR sync_status = 'erro') "
-                "ORDER BY criado_em LIMIT 50", (MAX_TENTATIVAS,))
+            cur.execute(sql, tuple(params))
             pending = cur.fetchall()
 
         if not pending:
-            print("[push] nenhum cadastro pendente.")
-            return
+            log("[push] nenhum cadastro pendente.")
+            return 0
 
         with pg.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as pc:
             for row in pending:
                 cid, nome, cpf_raw, tel, nasc, sim_pessoa, sim_cli = row
                 cpf = only_digits(cpf_raw)
                 if len(cpf) != 11:
-                    _mark_error(my, cid, "CPF invalido")
+                    if not dry_run:
+                        _mark_error(my, cid, "CPF invalido")
                     errors += 1
                     continue
                 if sim_pessoa and sim_cli:
@@ -155,10 +224,22 @@ def push_cadastros(env, dry_run):
 
                 # dedup por CPF
                 pc.execute(
-                    "SELECT \"Id\" FROM \"Pessoa\" WHERE "
+                    "SELECT \"Id\",\"Nome\" FROM \"Pessoa\" WHERE "
                     "regexp_replace(COALESCE(\"Documento\",''),'\\D','','g') = %s LIMIT 1",
                     (cpf,))
                 found = pc.fetchone()
+
+                if found and not forcar and conflito_de_nome(nome, found["Nome"]):
+                    msg = ("CPF ja cadastrado no SIM como '%s' (nome do clube: '%s'). "
+                           "Revisar: e a mesma pessoa? Se sim rode com --forcar."
+                           % (primeiro_nome(found["Nome"]), primeiro_nome(nome)))
+                    if dry_run:
+                        log("[push][dry-run] " + msg)
+                    else:
+                        _mark_error(my, cid, msg, tentar=False)
+                    errors += 1
+                    continue
+
                 pessoa_id = str(found["Id"]) if found else str(uuid.uuid5(NS, f"clube:pessoa:{cpf}"))
 
                 pc.execute("SELECT \"Id\" FROM \"Cliente\" WHERE \"PessoaId\" = %s LIMIT 1",
@@ -175,6 +256,7 @@ def push_cadastros(env, dry_run):
                 }
                 write_plan.append(item)
                 if dry_run:
+                    done += 1
                     continue
 
                 if not found:
@@ -195,9 +277,10 @@ def push_cadastros(env, dry_run):
                 done += 1
 
         if write_plan and not dry_run:
-            print("[push] backup:", backup(write_plan))
-        print(f"[push] pendentes={len(pending)} ok={done} erros={errors} "
-              f"{'(DRY-RUN, nada gravado)' if dry_run else ''}")
+            log("[push] backup: " + backup(write_plan))
+        log(f"[push] pendentes={len(pending)} ok={done} erros={errors} "
+            f"{'(DRY-RUN, nada gravado)' if dry_run else ''}")
+        return errors
     finally:
         pg.close()
         my.close()
@@ -211,11 +294,12 @@ def _mark_ok(my, cid, pessoa_id, cliente_id):
             (pessoa_id, cliente_id, cid))
 
 
-def _mark_error(my, cid, msg):
+def _mark_error(my, cid, msg, tentar=True):
     with my.cursor() as cur:
         cur.execute(
             "UPDATE clientes SET sync_status='erro', sync_erro=%s, "
-            "sync_tentativas=sync_tentativas+1 WHERE id=%s", (msg[:500], cid))
+            "sync_tentativas=sync_tentativas+%s WHERE id=%s",
+            (msg[:500], 1 if tentar else 0, cid))
 
 
 # ------------------------------------------------------------------
@@ -225,17 +309,18 @@ def pull_compras(env, dry_run, dias):
     read_url = sim_read_url(env)
     my = mysql_conn(club_url(env))
     pg = pg_conn(read_url, readonly=True)
-    inserted = updated = 0
+    inserted = 0
 
     try:
         with my.cursor() as cur:
-            cur.execute("SELECT cpf, id FROM clientes")
+            cur.execute("SELECT cpf, id FROM clientes "
+                       "WHERE excluido_em IS NULL AND sim_cliente_id IS NOT NULL")
             cpf_map = {only_digits(cpf): cid for cpf, cid in cur.fetchall() if only_digits(cpf)}
             cur.execute("SELECT valor FROM sync_control WHERE chave='compras_watermark'")
             wm = cur.fetchone()
         if not cpf_map:
-            print("[pull] nenhum cliente com CPF no clube.")
-            return
+            log("[pull] nenhum cliente com CPF no clube.")
+            return 0
 
         since = datetime.now() - timedelta(days=dias)
         if wm and wm[0]:
@@ -284,8 +369,8 @@ def pull_compras(env, dry_run, dias):
                     })
 
         if not rows:
-            print(f"[pull] nenhuma venda nova desde {since:%d/%m/%Y}.")
-            return
+            log(f"[pull] nenhuma venda nova desde {since:%d/%m/%Y}.")
+            return 0
 
         max_dt = since
         with my.cursor() as cur:
@@ -320,11 +405,56 @@ def pull_compras(env, dry_run, dias):
                     "INSERT INTO sync_control (chave, valor) VALUES ('compras_watermark', %s) "
                     "ON DUPLICATE KEY UPDATE valor=VALUES(valor)",
                     (max_dt.isoformat(),))
-        print(f"[pull] desde {since:%d/%m/%Y} vendas_clube={inserted} "
-              f"{'(DRY-RUN, nada gravado)' if dry_run else ''}")
+        log(f"[pull] desde {since:%d/%m/%Y} vendas_clube={inserted} "
+            f"{'(DRY-RUN, nada gravado)' if dry_run else ''}")
+        return 0
     finally:
         pg.close()
         my.close()
+
+
+# ------------------------------------------------------------------
+# 3) STATUS (para a loja ver como esta a fila)
+# ------------------------------------------------------------------
+def status(env):
+    my = mysql_conn(club_url(env))
+    try:
+        with my.cursor() as cur:
+            cur.execute("SELECT sync_status, COUNT(*) AS n FROM clientes GROUP BY sync_status")
+            contagem = {r[0]: r[1] for r in cur.fetchall()}
+            cur.execute(
+                "SELECT nome, cpf, sync_erro, sync_tentativas, criado_em FROM clientes "
+                "WHERE sync_status='erro' ORDER BY atualizado_em DESC LIMIT 10")
+            erros = cur.fetchall()
+            cur.execute(
+                "SELECT nome, cpf, last_synced_at FROM clientes "
+                "WHERE sync_status='sincronizado' ORDER BY last_synced_at DESC LIMIT 5")
+            ok = cur.fetchall()
+    finally:
+        my.close()
+
+    print("\n=== Fila de sincronizacao do clube ===")
+    for chave in ("pendente", "sincronizado", "erro", "ignorado"):
+        print(f"  {chave:12s}: {contagem.get(chave, 0)}")
+
+    if ok:
+        print("\nUltimos cadastros que chegaram na loja:")
+        for nome, cpf, quando in ok:
+            print(f"  - {nome[:34]:34s} {fmt_cpf(only_digits(cpf)):16s} "
+                  f"{quando:%d/%m/%Y %H:%M}" if quando else "")
+    if erros:
+        print("\nPrecisam de atencao:")
+        for nome, cpf, erro, tent, quando in erros:
+            print(f"  - {nome[:34]:34s} {fmt_cpf(only_digits(cpf))}")
+            print(f"      {erro} (tentativas: {tent})")
+
+    ultima = ""
+    if os.path.isfile(LOG_PATH):
+        with open(LOG_PATH, encoding="utf-8", errors="ignore") as fh:
+            linhas = fh.read().strip().splitlines()
+            ultima = linhas[-1] if linhas else ""
+    print("\nUltima execucao:", ultima or "nunca rodou")
+    print()
 
 
 def main():
@@ -332,18 +462,37 @@ def main():
     ap.add_argument("--push-cadastros", action="store_true")
     ap.add_argument("--pull-compras", action="store_true")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--status", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--cpf", default=None, help="sincroniza so este CPF")
+    ap.add_argument("--forcar", action="store_true",
+                    help="vincula mesmo se o nome no SIM for diferente")
     ap.add_argument("--dias", type=int, default=int(os.environ.get("COMPRAS_DIAS_INICIAIS", "90")))
     args = ap.parse_args()
 
     env = load_env()
-    if args.all or args.push_cadastros:
-        push_cadastros(env, args.dry_run)
-    if args.all or args.pull_compras:
-        pull_compras(env, args.dry_run, args.dias)
+
+    if args.status:
+        status(env)
+        return 0
+
     if not (args.all or args.push_cadastros or args.pull_compras):
         ap.print_help()
+        return 0
+
+    if not pegar_lock():
+        return 0
+    try:
+        erros = 0
+        if args.all or args.push_cadastros:
+            erros += push_cadastros(env, args.dry_run,
+                                    only_digits(args.cpf) or None, args.forcar)
+        if args.all or args.pull_compras:
+            erros += pull_compras(env, args.dry_run, args.dias)
+        return 1 if erros else 0
+    finally:
+        soltar_lock()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

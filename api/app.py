@@ -3,6 +3,8 @@
 Responsabilidades:
   - cadastro/login do cliente (CPF + senha)
   - listar compras e resumo (total gasto / economizado)
+  - LGPD: exportar os dados do titular (art. 18, II) e excluir a conta
+  - newsletter do site (antes ficava so no localStorage do navegador)
 Le SOMENTE o banco do clube (TiDB). Nunca acessa o SIM.
 
 Fase 1 (endurecimento):
@@ -15,11 +17,21 @@ Fase 1 (endurecimento):
   - cadastro: aceite obrigatorio, data de nascimento plausivel,
     corrida de CPF duplicado devolve 409 (nao 500)
   - token sem CPF no payload (menos dado pessoal exposto)
+
+Fase 2 (LGPD de verdade + consentimento + newsletter):
+  - consentimento gravado com data e versao do texto aceito
+  - /api/me/dados  : exporta tudo que o clube guarda do titular
+  - /api/me/excluir: anonimiza a conta (nome, CPF, telefone, e-mail,
+    data de nascimento e senha). Compras ficam sem dado pessoal
+    (obrigacao fiscal) e a conta nao loga mais.
+  - /api/newsletter: grava o e-mail no banco (nao mais no navegador)
 """
 import hashlib
 import hmac
+import json
 import os
 import queue
+import re
 import secrets
 import sys
 import threading
@@ -38,6 +50,10 @@ from pydantic import BaseModel, Field
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_CANDIDATES = [os.path.join(ROOT, ".env")]
+
+# Versao do texto de consentimento (politica de privacidade) aceito no cadastro.
+# Trocar a data quando o texto mudar de forma relevante.
+VERSAO_POLITICA = os.environ.get("CLUBE_POLITICA_VERSAO", "2026-10-31")
 
 
 def load_env():
@@ -253,6 +269,8 @@ class RateLimit:
 LIMITE_CADASTRO_IP = RateLimit(5, 3600)      # 5 cadastros por hora por IP
 LIMITE_LOGIN_IP = RateLimit(15, 600)         # 15 tentativas por 10 min por IP
 LIMITE_LOGIN_CPF = RateLimit(6, 600)         # 6 tentativas por 10 min por CPF
+LIMITE_EXPORT = RateLimit(10, 3600)          # exportar/excluir: 10 por hora
+LIMITE_NEWSLETTER = RateLimit(5, 3600)       # 5 inscricoes por hora por IP
 
 
 def ip_do_cliente(request: Request) -> str:
@@ -284,9 +302,19 @@ class Login(BaseModel):
     senha: str
 
 
+class Exclusao(BaseModel):
+    senha: str
+    confirmacao: str
+
+
+class Inscricao(BaseModel):
+    email: str
+    origem: str | None = None
+
+
 app = FastAPI(
     title="Clube Diana API",
-    version="1.1.0",
+    version="1.2.0",
     docs_url="/docs" if DOCS_ATIVO else None,
     redoc_url="/redoc" if DOCS_ATIVO else None,
     openapi_url="/openapi.json" if DOCS_ATIVO else None,
@@ -383,9 +411,10 @@ def register(body: Cadastro, request: Request):
             try:
                 cur.execute(
                     "INSERT INTO clientes (id,nome,cpf,telefone,data_nascimento,senha_hash,"
-                    "aceite_lgpd,sync_status) VALUES (%s,%s,%s,%s,%s,%s,%s,'pendente')",
+                    "aceite_lgpd,aceite_em,aceite_versao,sync_status) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,NOW(),%s,'pendente')",
                     (cid, nome, cpf, telefone or None,
-                     nasc, hash_senha(body.senha), 1))
+                     nasc, hash_senha(body.senha), 1, VERSAO_POLITICA))
             except pymysql.err.IntegrityError:
                 # dois cliques ao mesmo tempo: o UNIQUE(cpf) barra o segundo
                 raise HTTPException(409, "Este CPF ja tem cadastro. Faca login.")
@@ -404,12 +433,15 @@ def login(body: Login, request: Request):
     conn = db()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,nome,cpf,senha_hash FROM clientes WHERE cpf=%s", (cpf,))
+            cur.execute("SELECT id,nome,cpf,senha_hash,excluido_em FROM clientes WHERE cpf=%s",
+                        (cpf,))
             row = cur.fetchone()
     finally:
         conn.close()
     if not row or not verifica_senha(body.senha, row["senha_hash"]):
         raise HTTPException(401, "CPF ou senha incorretos")
+    if row.get("excluido_em"):
+        raise HTTPException(403, "Esta conta foi excluida. Fale com a loja para voltar ao clube.")
     return {"ok": True, "token": token(row["id"]),
             "cliente": {"nome": row["nome"], "cpf": row["cpf"]}}
 
@@ -452,3 +484,130 @@ def resumo(user=Depends(atual)):
             "total_gasto": float(r["gasto"] or 0),
             "total_economizado": float(r["economia"] or 0),
             "ultima_compra": r["ultima"].strftime("%d/%m/%Y") if r["ultima"] else None}
+
+
+@app.get("/api/me/dados")
+def meus_dados(user=Depends(atual)):
+    """LGPD art. 18, II: copia completa dos dados que o clube guarda."""
+    exigir_limite(LIMITE_EXPORT, f"export:{user['id']}")
+
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT nome,cpf,telefone,email,data_nascimento,criado_em,atualizado_em,"
+                "aceite_em,aceite_versao,sync_status,last_synced_at "
+                "FROM clientes WHERE id=%s", (user["id"],))
+            c = cur.fetchone()
+            if not c:
+                raise HTTPException(404, "Conta nao encontrada")
+            cur.execute(
+                "SELECT data_venda,total_produtos,total_desconto,total_liquido,cupom,itens_json "
+                "FROM compras WHERE cliente_id=%s ORDER BY data_venda DESC", (user["id"],))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    def data(v):
+        return v.strftime("%Y-%m-%d") if v else None
+
+    def data_hora(v):
+        return v.strftime("%Y-%m-%d %H:%M:%S") if v else None
+
+    compras = []
+    for r in rows:
+        itens = r.get("itens_json")
+        if isinstance(itens, str):
+            try:
+                itens = json.loads(itens)
+            except ValueError:
+                itens = []
+        compras.append({
+            "data": data_hora(r["data_venda"]),
+            "total_produtos": float(r["total_produtos"] or 0),
+            "total_desconto": float(r["total_desconto"] or 0),
+            "total_liquido": float(r["total_liquido"] or 0),
+            "cupom": r["cupom"],
+            "itens": itens or [],
+        })
+
+    return {
+        "ok": True,
+        "gerado_em": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "titular": {
+            "nome": c["nome"],
+            "cpf": c["cpf"],
+            "telefone": c["telefone"],
+            "email": c["email"],
+            "data_nascimento": data(c["data_nascimento"]),
+            "conta_criada_em": data_hora(c["criado_em"]),
+            "ultima_atualizacao": data_hora(c["atualizado_em"]),
+            "consentimento_em": data_hora(c.get("aceite_em")),
+            "consentimento_versao": c.get("aceite_versao"),
+            "situacao_no_clube": c.get("sync_status"),
+            "sincronizado_com_a_loja_em": data_hora(c.get("last_synced_at")),
+        },
+        "compras": compras,
+        "observacoes": (
+            "Este arquivo contem os dados do Clube Diana. As compras ficam "
+            "vinculadas ao seu CPF apenas quando voce informa o CPF no caixa."
+        ),
+    }
+
+
+@app.post("/api/me/excluir")
+def excluir_conta(body: Exclusao, user=Depends(atual)):
+    """LGPD art. 18, VI: apaga os dados pessoais e desativa a conta.
+
+    O historico de compras permanece (obrigacao fiscal) mas sem nome, CPF,
+    telefone ou e-mail: fica ligado apenas a um identificador anonimo.
+    """
+    if (body.confirmacao or "").strip().upper() != "EXCLUIR":
+        raise HTTPException(400, "Digite EXCLUIR para confirmar")
+    exigir_limite(LIMITE_EXPORT, f"exclusao:{user['id']}")
+
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT cpf,senha_hash,excluido_em FROM clientes WHERE id=%s",
+                        (user["id"],))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Conta nao encontrada")
+            if row.get("excluido_em"):
+                raise HTTPException(409, "Esta conta ja foi excluida")
+            if not verifica_senha(body.senha, row["senha_hash"]):
+                raise HTTPException(401, "Senha incorreta")
+
+            # identificador anonimo, unico e irreversivel (nao e mais um CPF)
+            anonimo = "EX" + hashlib.sha256(
+                (row["cpf"] + JWT_SECRET).encode()).hexdigest()[:9]
+            cur.execute(
+                "UPDATE clientes SET nome=%s, cpf=%s, telefone=NULL, email=NULL, "
+                "data_nascimento=NULL, senha_hash=%s, excluido_em=NOW(), "
+                "sync_status='ignorado', sync_erro=NULL WHERE id=%s",
+                ("Titular excluido", anonimo,
+                 hash_senha(secrets.token_hex(16)), user["id"]))
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.post("/api/newsletter")
+def newsletter(body: Inscricao, request: Request):
+    exigir_limite(LIMITE_NEWSLETTER, f"news:{ip_do_cliente(request)}")
+
+    email = (body.email or "").strip().lower()
+    if len(email) > 190 or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$", email):
+        raise HTTPException(400, "E-mail invalido")
+
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO newsletter (id,email,origem) VALUES (%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE origem=VALUES(origem)",
+                (secrets.token_hex(18)[:36], email, (body.origem or "site")[:40]))
+    finally:
+        conn.close()
+    return {"ok": True}

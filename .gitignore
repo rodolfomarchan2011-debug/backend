@@ -4,11 +4,13 @@
 
 # Banco local / backups
 backups/
+logs/
 *.db
 *.sqlite
 *.sql
 # schema do banco e codigo (versionar), dumps ficam em backups/
 !sql/schema.sql
+!sql/*.sql
 
 # Python
 __pycache__/
