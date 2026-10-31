@@ -69,3 +69,27 @@ CREATE TABLE IF NOT EXISTS sync_control (
   atualizado_em DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (chave)
 ) ENGINE=InnoDB;
+
+-- ------------------------------------------------------------
+-- Ofertas do site (editadas no painel da loja, lidas pela API)
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ofertas (
+  id            VARCHAR(36)  NOT NULL,
+  produto       VARCHAR(120) NOT NULL,
+  descricao     VARCHAR(400) NULL,
+  categoria     VARCHAR(60)  NULL,
+  preco_de      DECIMAL(10,2) NOT NULL DEFAULT 0,
+  preco_por     DECIMAL(10,2) NOT NULL DEFAULT 0,
+  unidade       VARCHAR(12)  NOT NULL DEFAULT 'kg',
+  desconto      INT          NULL,
+  imagem_url    VARCHAR(255) NULL,
+  imagem_mime   VARCHAR(60)  NULL,
+  imagem_bytes  MEDIUMBLOB   NULL,
+  destaque      TINYINT(1)   NOT NULL DEFAULT 0,
+  ativo         TINYINT(1)   NOT NULL DEFAULT 1,
+  ordem         INT          NOT NULL DEFAULT 0,
+  criado_em     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  atualizado_em DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_ofertas_listagem (ativo, ordem)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

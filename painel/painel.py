@@ -14,8 +14,10 @@ Permite:
   - reenviar um cadastro (volta para a fila)
   - corrigir o CPF de um cadastro com erro
 """
+import base64
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -41,6 +43,7 @@ ENV_CANDIDATES = [
 LOG_PATH = os.path.join(ROOT, "logs", "sync.log")
 BACKUP_DIR = os.path.join(ROOT, "backups")
 ALERTA_PATH = os.path.join(ROOT, "logs", "ALERTA.txt")
+SITE_URL = "https://clube-diana.onrender.com"
 
 _rodando = threading.Lock()
 
@@ -478,6 +481,236 @@ def home():
     return HTML
 
 
+# ---------------- ofertas do site ----------------
+# A loja edita aqui o que aparece em "Ofertas da semana" no site.
+# Grava direto no banco do clube; a API publica (GET /api/ofertas) e o site
+# atualiza sozinho em ate 1 minuto. Sem programador, sem novo deploy.
+
+class OfertaEntrada(BaseModel):
+    id: str | None = None
+    produto: str = ""
+    descricao: str | None = None
+    categoria: str | None = None
+    preco_de: float = 0
+    preco_por: float = 0
+    unidade: str = "kg"
+    desconto: int | None = None
+    destaque: bool = False
+    ativo: bool = True
+    imagem_base64: str | None = None
+    remover_foto: bool = False
+
+
+class OfertaAcao(BaseModel):
+    id: str
+    ativo: bool | None = None
+
+
+class OfertaMovimento(BaseModel):
+    id: str
+    direcao: str
+
+
+def _limpo(valor, limite):
+    return " ".join(str(valor or "").split())[:limite]
+
+
+def _decodificar_foto(valor):
+    """Aceita dataURL (data:image/jpeg;base64,...) ou base64 puro."""
+    if not valor:
+        return None, None
+    mime = "image/jpeg"
+    dados = valor
+    if valor.startswith("data:"):
+        cabecalho, _, dados = valor.partition(",")
+        if ";" in cabecalho:
+            mime = (cabecalho[5:].split(";")[0] or mime).strip()
+    try:
+        bruto = base64.b64decode(dados, validate=False)
+    except Exception:
+        raise HTTPException(400, "Nao foi possivel ler a foto enviada")
+    if not bruto:
+        return None, None
+    if len(bruto) > 2 * 1024 * 1024:
+        raise HTTPException(400, "Foto muito grande. Use uma imagem de ate 2 MB.")
+    if mime not in ("image/jpeg", "image/png", "image/webp"):
+        mime = "image/jpeg"
+    return bruto, mime
+
+
+def _foto_publica(linha):
+    if linha.get("tem_foto"):
+        return "/api/ofertas/foto/" + str(linha["id"])
+    url = (linha.get("imagem_url") or "").strip()
+    if url and not url.startswith("http") and not url.startswith("/"):
+        url = SITE_URL + "/" + url
+    return url
+
+
+@app.get("/api/ofertas")
+def listar_ofertas():
+    db = conn()
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT id,produto,descricao,categoria,preco_de,preco_por,unidade,"
+                "desconto,imagem_url,(imagem_bytes IS NOT NULL) AS tem_foto,"
+                "destaque,ativo,ordem,atualizado_em FROM ofertas "
+                "ORDER BY ativo DESC, ordem, criado_em")
+            linhas = cur.fetchall()
+    finally:
+        db.close()
+
+    for l in linhas:
+        l["preco_de"] = float(l["preco_de"] or 0)
+        l["preco_por"] = float(l["preco_por"] or 0)
+        l["desconto"] = int(l["desconto"]) if l["desconto"] is not None else 0
+        l["destaque"] = bool(l["destaque"])
+        l["ativo"] = bool(l["ativo"])
+        l["foto"] = _foto_publica(l)
+        l["atualizado_em"] = (l["atualizado_em"].strftime("%d/%m/%Y %H:%M")
+                              if l["atualizado_em"] else "")
+
+    ativas = sum(1 for l in linhas if l["ativo"])
+    return {"ok": True, "ofertas": linhas, "ativas": ativas, "total": len(linhas),
+            "site": SITE_URL}
+
+
+@app.get("/api/ofertas/foto/{oferta_id}")
+def foto_oferta(oferta_id: str):
+    db = conn()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT imagem_bytes, imagem_mime FROM ofertas WHERE id=%s",
+                        (oferta_id,))
+            linha = cur.fetchone()
+    finally:
+        db.close()
+    if not linha or not linha.get("imagem_bytes"):
+        raise HTTPException(404, "Sem foto")
+    mime = linha.get("imagem_mime") or "image/jpeg"
+    if mime not in ("image/jpeg", "image/png", "image/webp"):
+        mime = "image/jpeg"
+    return Response(content=bytes(linha["imagem_bytes"]), media_type=mime,
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/ofertas/salvar")
+def salvar_oferta(body: OfertaEntrada):
+    produto = _limpo(body.produto, 120)
+    if len(produto) < 2:
+        raise HTTPException(400, "Informe o nome do produto")
+    if body.preco_por <= 0:
+        raise HTTPException(400, "Informe o preco do clube (quanto o membro paga)")
+    if body.preco_por > 100000:
+        raise HTTPException(400, "Preco do clube invalido")
+
+    preco_de = max(0.0, min(float(body.preco_de or 0), 100000))
+    desconto = body.desconto
+    if desconto is None:
+        desconto = round((1 - body.preco_por / preco_de) * 100) if preco_de > body.preco_por else 0
+    desconto = max(0, min(int(desconto), 100))
+
+    unidade = _limpo(body.unidade, 12) or "kg"
+    descricao = _limpo(body.descricao, 400)
+    categoria = _limpo(body.categoria, 60)
+    foto, mime = _decodificar_foto(body.imagem_base64)
+
+    db = conn()
+    try:
+        with db.cursor() as cur:
+            if body.id:
+                cur.execute("SELECT id FROM ofertas WHERE id=%s", (body.id,))
+                if not cur.fetchone():
+                    raise HTTPException(404, "Oferta nao encontrada")
+                campos = ["produto=%s", "descricao=%s", "categoria=%s", "preco_de=%s",
+                          "preco_por=%s", "unidade=%s", "desconto=%s", "destaque=%s",
+                          "ativo=%s"]
+                valores = [produto, descricao or None, categoria or None, preco_de,
+                           body.preco_por, unidade, desconto,
+                           1 if body.destaque else 0, 1 if body.ativo else 0]
+                if foto:
+                    campos += ["imagem_bytes=%s", "imagem_mime=%s", "imagem_url=NULL"]
+                    valores += [foto, mime]
+                elif body.remover_foto:
+                    campos += ["imagem_bytes=NULL", "imagem_mime=NULL", "imagem_url=NULL"]
+                cur.execute("UPDATE ofertas SET " + ", ".join(campos) + " WHERE id=%s",
+                            tuple(valores) + (body.id,))
+                oid, mensagem = body.id, "Oferta atualizada. O site mostra em ate 1 minuto."
+            else:
+                oid = secrets.token_hex(8)
+                cur.execute("SELECT COALESCE(MAX(ordem),0)+1 AS proxima FROM ofertas")
+                ordem = int((cur.fetchone() or {}).get("proxima") or 1)
+                cur.execute(
+                    "INSERT INTO ofertas (id,produto,descricao,categoria,preco_de,preco_por,"
+                    "unidade,desconto,imagem_bytes,imagem_mime,destaque,ativo,ordem) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (oid, produto, descricao or None, categoria or None, preco_de,
+                     body.preco_por, unidade, desconto, foto, mime if foto else None,
+                     1 if body.destaque else 0, 1 if body.ativo else 0, ordem))
+                mensagem = "Oferta publicada. O site mostra em ate 1 minuto."
+    finally:
+        db.close()
+    return {"ok": True, "id": oid, "mensagem": mensagem}
+
+
+@app.post("/api/ofertas/ativo")
+def ativar_oferta(body: OfertaAcao):
+    if body.ativo is None:
+        raise HTTPException(400, "Informe ativo=true ou false")
+    db = conn()
+    try:
+        with db.cursor() as cur:
+            cur.execute("UPDATE ofertas SET ativo=%s WHERE id=%s",
+                        (1 if body.ativo else 0, body.id))
+            if cur.rowcount == 0:
+                raise HTTPException(404, "Oferta nao encontrada")
+    finally:
+        db.close()
+    return {"ok": True,
+            "mensagem": "Oferta no ar de novo." if body.ativo else "Oferta fora do site."}
+
+
+@app.post("/api/ofertas/mover")
+def mover_oferta(body: OfertaMovimento):
+    if body.direcao not in ("cima", "baixo"):
+        raise HTTPException(400, "Direcao invalida")
+    db = conn()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT id,ordem FROM ofertas ORDER BY ativo DESC, ordem, criado_em")
+            lista = cur.fetchall()
+            ids = [l["id"] for l in lista]
+            if body.id not in ids:
+                raise HTTPException(404, "Oferta nao encontrada")
+            i = ids.index(body.id)
+            j = i - 1 if body.direcao == "cima" else i + 1
+            if j < 0 or j >= len(lista):
+                return {"ok": True, "mensagem": "Ja esta no limite."}
+            a, b = lista[i], lista[j]
+            # normaliza a ordem inteira e troca as duas posicoes
+            for k, linha in enumerate(lista):
+                cur.execute("UPDATE ofertas SET ordem=%s WHERE id=%s", (k + 1, linha["id"]))
+            cur.execute("UPDATE ofertas SET ordem=%s WHERE id=%s", (j + 1, a["id"]))
+            cur.execute("UPDATE ofertas SET ordem=%s WHERE id=%s", (i + 1, b["id"]))
+    finally:
+        db.close()
+    return {"ok": True, "mensagem": "Ordem atualizada."}
+
+
+@app.post("/api/ofertas/excluir")
+def excluir_oferta(body: Id):
+    db = conn()
+    try:
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM ofertas WHERE id=%s", (body.id,))
+            if cur.rowcount == 0:
+                raise HTTPException(404, "Oferta nao encontrada")
+    finally:
+        db.close()
+    return {"ok": True, "mensagem": "Oferta apagada."}
+
+
 HTML = """<!doctype html>
 <html lang="pt-BR">
 <head>
@@ -545,6 +778,38 @@ HTML = """<!doctype html>
   table.rel{width:100%;border-collapse:collapse;font-size:13px}
   table.rel th,table.rel td{padding:7px 8px;border-bottom:1px solid var(--linha);text-align:left}
   table.rel th{font-size:10px;text-transform:uppercase;color:#7a6b59}
+
+  /* Ofertas do site */
+  .of-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:12px}
+  .of-card{background:#fff;border:1px solid var(--linha);border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
+  .of-card.inativa{opacity:.6}
+  .of-foto{width:100%;height:132px;object-fit:cover;display:block;background:#f1e7d8}
+  .of-sem-foto{height:132px;display:flex;align-items:center;justify-content:center;background:#f6efe3;color:#a08b72;font-size:12px}
+  .of-corpo{padding:10px 12px 12px;display:flex;flex-direction:column;gap:5px;flex:1}
+  .of-topo{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+  .of-nome{font-weight:700;font-size:14px;line-height:1.25}
+  .of-meta{font-size:12px;color:#7a6b59}
+  .of-preco{font-size:13px}
+  .of-preco s{color:#9a8b78}
+  .of-preco b{color:var(--vermelho);font-size:15px}
+  .of-acoes{display:flex;flex-wrap:wrap;gap:6px;margin-top:auto;padding-top:8px}
+  .of-acoes button.mini{padding:4px 8px}
+  .of-vazio{background:#fff;border:1px dashed var(--linha);border-radius:12px;padding:18px;color:#8a7b69;font-size:13px}
+  #of-form{display:flex;flex-direction:column;gap:10px}
+  #of-form label{font-size:12px;font-weight:700;color:#5d5145}
+  #of-form input[type=text],#of-form input[type=number],#of-form select,#of-form textarea{
+    font:inherit;padding:8px 10px;border:1px solid var(--linha);border-radius:8px;width:100%;background:#fff}
+  #of-form textarea{resize:vertical;min-height:64px}
+  .of-linha{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .of-linha3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+  .of-check{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600}
+  .of-check input{width:auto}
+  .of-preview{display:flex;align-items:center;gap:10px}
+  .of-preview img{width:88px;height:66px;object-fit:cover;border-radius:8px;border:1px solid var(--linha);background:#f1e7d8}
+  .of-preview .sem{width:88px;height:66px;border-radius:8px;border:1px dashed var(--linha);display:flex;align-items:center;justify-content:center;font-size:10px;color:#a08b72;text-align:center}
+  dialog#dlg-oferta{max-width:520px}
+  dialog#dlg-oferta h3{margin:0 0 4px}
+  dialog#dlg-oferta .dica{margin:0 0 12px}
 </style>
 </head>
 <body>
@@ -581,6 +846,19 @@ HTML = """<!doctype html>
     <tbody id="linhas"><tr><td colspan="5">carregando...</td></tr></tbody>
   </table>
 
+  <h2 class="secao">Ofertas do site</h2>
+  <p class="dica">O que aparece na secao "Ofertas da semana" em clube-diana.onrender.com.
+    O que voce salva aqui vai para o site em ate 1 minuto - sem programador e sem
+    precisar publicar o site de novo. Desative uma oferta para tira-la do site sem
+    apagar o cadastro dela.</p>
+  <div class="barra">
+    <button class="principal" id="btn-nova-oferta">Nova oferta</button>
+    <button id="btn-atualizar-ofertas">Atualizar lista</button>
+    <button id="btn-ver-site">Abrir o site</button>
+    <span id="ofertas-resumo" style="font-size:12px;color:#8a7b69;align-self:center"></span>
+  </div>
+  <div id="ofertas-lista" class="of-grid">carregando...</div>
+
   <h2 class="secao">Adesao do CPF no caixa</h2>
   <p class="dica">Vendas em que o caixa identificou o cliente. Se o operador nao escolhe o cliente (ou digita o CPF), a compra nao aparece no painel do cliente.</p>
   <div id="adesao" class="adesao">carregando...</div>
@@ -612,6 +890,72 @@ HTML = """<!doctype html>
     <button id="dlg-cancelar">Cancelar</button>
     <button class="principal" id="dlg-salvar">Salvar e reenviar</button>
   </div>
+</dialog>
+
+<dialog id="dlg-oferta">
+  <h3 id="of-titulo">Nova oferta</h3>
+  <p class="dica">Preencha como o cliente vai ler no site. O desconto e calculado
+    sozinho quando voce poe o preco normal e o preco do clube.</p>
+  <form id="of-form" method="dialog">
+    <div>
+      <label for="of-produto">Produto *</label>
+      <input type="text" id="of-produto" maxlength="120" placeholder="Ex.: Picanha bovina" required>
+    </div>
+    <div class="of-linha">
+      <div>
+        <label for="of-categoria">Categoria</label>
+        <input type="text" id="of-categoria" maxlength="60" placeholder="Ex.: Carnes nobres">
+      </div>
+      <div>
+        <label for="of-unidade">Unidade</label>
+        <select id="of-unidade">
+          <option value="kg">kg</option>
+          <option value="un">un</option>
+          <option value="pc">pc</option>
+          <option value="cx">cx</option>
+          <option value="bandeja">bandeja</option>
+        </select>
+      </div>
+    </div>
+    <div>
+      <label for="of-descricao">Descricao</label>
+      <textarea id="of-descricao" maxlength="400" placeholder="Uma frase que da vontade de comprar."></textarea>
+    </div>
+    <div class="of-linha3">
+      <div>
+        <label for="of-preco-de">Preco normal (R$)</label>
+        <input type="number" id="of-preco-de" min="0" step="0.01" placeholder="89,90">
+      </div>
+      <div>
+        <label for="of-preco-por">Preco do clube (R$) *</label>
+        <input type="number" id="of-preco-por" min="0.01" step="0.01" placeholder="71,90" required>
+      </div>
+      <div>
+        <label for="of-desconto">Desconto (%)</label>
+        <input type="number" id="of-desconto" min="0" max="100" step="1" placeholder="auto">
+      </div>
+    </div>
+    <div>
+      <label for="of-foto">Foto (opcional)</label>
+      <div class="of-preview">
+        <div id="of-preview-box"><div class="sem">sem foto</div></div>
+        <div style="flex:1">
+          <input type="file" id="of-foto" accept="image/*" style="font-size:12px">
+          <div class="of-meta" style="margin-top:4px">JPG, PNG ou WEBP. A imagem e reduzida sozinha.</div>
+          <button type="button" class="mini" id="of-remover-foto" style="margin-top:6px">Remover foto</button>
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;gap:18px;flex-wrap:wrap">
+      <label class="of-check"><input type="checkbox" id="of-destaque"> Destaque</label>
+      <label class="of-check"><input type="checkbox" id="of-ativo" checked> Mostrar no site</label>
+    </div>
+    <div class="erro-linha" id="of-erro"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px">
+      <button type="button" id="of-cancelar">Cancelar</button>
+      <button type="button" class="principal" id="of-salvar">Salvar oferta</button>
+    </div>
+  </form>
 </dialog>
 
 <script>
@@ -822,6 +1166,240 @@ function baixarCsv(tipo) {
 
 document.getElementById("btn-csv-clientes").addEventListener("click", function () { baixarCsv("clientes"); });
 document.getElementById("btn-csv-compras").addEventListener("click", function () { baixarCsv("compras"); });
+
+/* ---------- Ofertas do site ---------- */
+
+var ofertaEditando = null;
+var fotoNova = null;
+var fotoRemovida = false;
+var ofertasCarregadas = [];
+
+function reais(v) {
+  return "R$ " + (v || 0).toFixed(2).replace(".", ",");
+}
+
+function carregarOfertas() {
+  var alvo = $("ofertas-lista");
+  fetch("/api/ofertas").then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { alvo.innerHTML = "<div class='of-vazio'>Nao foi possivel carregar.</div>"; return; }
+    ofertasCarregadas = d.ofertas || [];
+    $("ofertas-resumo").textContent = d.ativas + " no site de " + d.total + " cadastradas";
+    if (!ofertasCarregadas.length) {
+      alvo.innerHTML = "<div class='of-vazio'>Nenhuma oferta ainda. Clique em \"Nova oferta\" para publicar a primeira.</div>";
+      return;
+    }
+    alvo.innerHTML = ofertasCarregadas.map(function (o) {
+      var foto = o.foto
+        ? "<img class='of-foto' src='" + esc(o.foto) + "' alt='' loading='lazy'>"
+        : "<div class='of-sem-foto'>sem foto</div>";
+      var antes = o.preco_de > 0 ? "<s>" + reais(o.preco_de) + "</s> " : "";
+      var selo = o.desconto ? " <span class='tag pendente'>-" + o.desconto + "%</span>" : "";
+      var situacao = o.ativo ? "" : " <span class='tag ignorado'>fora do site</span>";
+      return "<div class='of-card" + (o.ativo ? "" : " inativa") + "'>" + foto +
+        "<div class='of-corpo'>" +
+          "<div class='of-topo'><div class='of-nome'>" + esc(o.produto) + "</div>" + situacao + "</div>" +
+          "<div class='of-meta'>" + esc(o.categoria || "sem categoria") + " - " + esc(o.unidade) + "</div>" +
+          "<div class='of-preco'>" + antes + "<b>" + reais(o.preco_por) + "</b>/" + esc(o.unidade) + selo + "</div>" +
+          "<div class='of-acoes'>" +
+            "<button class='mini' data-of='editar' data-id='" + esc(o.id) + "'>Editar</button>" +
+            "<button class='mini' data-of='ativo' data-id='" + esc(o.id) + "' data-valor='" + (o.ativo ? "0" : "1") + "'>" +
+              (o.ativo ? "Tirar do site" : "Publicar") + "</button>" +
+            "<button class='mini' data-of='cima' data-id='" + esc(o.id) + "' title='Subir'>&#8593;</button>" +
+            "<button class='mini' data-of='baixo' data-id='" + esc(o.id) + "' title='Descer'>&#8595;</button>" +
+            "<button class='mini' data-of='excluir' data-id='" + esc(o.id) + "' data-nome='" + esc(o.produto) + "'>Excluir</button>" +
+          "</div>" +
+        "</div></div>";
+    }).join("");
+  }).catch(function () {
+    alvo.innerHTML = "<div class='of-vazio'>Sem conexao com o banco.</div>";
+  });
+}
+
+function mostrarPreview(url) {
+  $("of-preview-box").innerHTML = url
+    ? "<img src='" + esc(url) + "' alt=''>"
+    : "<div class='sem'>sem foto</div>";
+}
+
+function abrirOferta(id) {
+  var o = null;
+  if (id) {
+    o = ofertasCarregadas.filter(function (x) { return x.id === id; })[0];
+    if (!o) return;
+  }
+  ofertaEditando = o ? o.id : null;
+  fotoNova = null;
+  fotoRemovida = false;
+  $("of-titulo").textContent = o ? "Editar oferta" : "Nova oferta";
+  $("of-produto").value = o ? o.produto : "";
+  $("of-categoria").value = o ? (o.categoria || "") : "";
+  $("of-descricao").value = o ? (o.descricao || "") : "";
+  $("of-unidade").value = o ? (o.unidade || "kg") : "kg";
+  $("of-preco-de").value = o && o.preco_de ? String(o.preco_de).replace(".", ",") : "";
+  $("of-preco-por").value = o ? String(o.preco_por).replace(".", ",") : "";
+  $("of-desconto").value = o && o.desconto ? o.desconto : "";
+  $("of-destaque").checked = !!(o && o.destaque);
+  $("of-ativo").checked = o ? !!o.ativo : true;
+  $("of-foto").value = "";
+  $("of-erro").textContent = "";
+  mostrarPreview(o && o.foto ? o.foto : "");
+  $("dlg-oferta").showModal();
+  $("of-produto").focus();
+}
+
+function numeroDoCampo(id) {
+  var v = String($(id).value || "").trim().replace(/\./g, "").replace(",", ".");
+  var n = parseFloat(v);
+  return isNaN(n) ? 0 : n;
+}
+
+function calcularDesconto() {
+  var de = numeroDoCampo("of-preco-de");
+  var por = numeroDoCampo("of-preco-por");
+  if (de > 0 && por > 0 && de > por) {
+    $("of-desconto").value = Math.round((1 - por / de) * 100);
+  }
+}
+
+$("of-preco-de").addEventListener("input", calcularDesconto);
+$("of-preco-por").addEventListener("input", calcularDesconto);
+
+$("of-foto").addEventListener("change", function () {
+  var arquivo = this.files && this.files[0];
+  if (!arquivo) return;
+  if (!/^image\//.test(arquivo.type)) {
+    $("of-erro").textContent = "Escolha um arquivo de imagem.";
+    return;
+  }
+  var leitor = new FileReader();
+  leitor.onload = function () {
+    var img = new Image();
+    img.onload = function () {
+      var limite = 900;
+      var escala = Math.min(1, limite / Math.max(img.width, img.height));
+      var tela = document.createElement("canvas");
+      tela.width = Math.max(1, Math.round(img.width * escala));
+      tela.height = Math.max(1, Math.round(img.height * escala));
+      tela.getContext("2d").drawImage(img, 0, 0, tela.width, tela.height);
+      fotoNova = tela.toDataURL("image/jpeg", 0.85);
+      fotoRemovida = false;
+      mostrarPreview(fotoNova);
+      $("of-erro").textContent = "";
+    };
+    img.onerror = function () { $("of-erro").textContent = "Nao foi possivel ler a imagem."; };
+    img.src = leitor.result;
+  };
+  leitor.readAsDataURL(arquivo);
+});
+
+$("of-remover-foto").addEventListener("click", function () {
+  fotoNova = null;
+  fotoRemovida = true;
+  $("of-foto").value = "";
+  mostrarPreview("");
+});
+
+$("of-cancelar").addEventListener("click", function () { $("dlg-oferta").close(); });
+
+$("of-salvar").addEventListener("click", function () {
+  var produto = $("of-produto").value.trim();
+  var de = numeroDoCampo("of-preco-de");
+  var por = numeroDoCampo("of-preco-por");
+  var desconto = $("of-desconto").value;
+
+  if (produto.length < 2) { $("of-erro").textContent = "Informe o nome do produto."; return; }
+  if (!(por > 0)) { $("of-erro").textContent = "Informe o preco do clube."; return; }
+  if (de > 0 && por > de) {
+    $("of-erro").textContent = "O preco do clube esta maior que o preco normal.";
+    return;
+  }
+
+  var corpo = {
+    id: ofertaEditando,
+    produto: produto,
+    descricao: $("of-descricao").value.trim(),
+    categoria: $("of-categoria").value.trim(),
+    preco_de: de,
+    preco_por: por,
+    unidade: $("of-unidade").value,
+    desconto: desconto === "" ? null : parseInt(desconto, 10),
+    destaque: $("of-destaque").checked,
+    ativo: $("of-ativo").checked,
+    imagem_base64: fotoNova || null,
+    remover_foto: fotoRemovida
+  };
+
+  var botao = $("of-salvar");
+  botao.disabled = true;
+  botao.textContent = "Salvando...";
+  fetch("/api/ofertas/salvar", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(corpo)
+  }).then(function (r) {
+    return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+  }).then(function (x) {
+    botao.disabled = false;
+    botao.textContent = "Salvar oferta";
+    if (!x.ok) { $("of-erro").textContent = x.d.detail || "Nao foi possivel salvar."; return; }
+    $("dlg-oferta").close();
+    carregarOfertas();
+    alert(x.d.mensagem);
+  }).catch(function (e) {
+    botao.disabled = false;
+    botao.textContent = "Salvar oferta";
+    $("of-erro").textContent = "Erro de conexao: " + e;
+  });
+});
+
+function mudarAtivo(id, ativo) {
+  fetch("/api/ofertas/ativo", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: id, ativo: ativo })
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d.detail) { alert(d.detail); return; }
+    carregarOfertas();
+  });
+}
+
+function excluirOferta(id, nome) {
+  if (!confirm("Apagar a oferta \"" + nome + "\"?\n\nSe voce so quer tirar do site, use \"Tirar do site\" - assim ela fica guardada para depois.")) return;
+  fetch("/api/ofertas/excluir", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: id })
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d.detail) { alert(d.detail); return; }
+    carregarOfertas();
+  });
+}
+
+function moverOferta(id, direcao) {
+  fetch("/api/ofertas/mover", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: id, direcao: direcao })
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d.detail) { alert(d.detail); return; }
+    carregarOfertas();
+  });
+}
+
+$("ofertas-lista").addEventListener("click", function (ev) {
+  var b = ev.target.closest("button[data-of]");
+  if (!b) return;
+  var id = b.dataset.id;
+  var acao = b.dataset.of;
+  if (acao === "editar") abrirOferta(id);
+  else if (acao === "ativo") mudarAtivo(id, b.dataset.valor === "1");
+  else if (acao === "excluir") excluirOferta(id, b.dataset.nome);
+  else moverOferta(id, acao);
+});
+
+$("btn-nova-oferta").addEventListener("click", function () { abrirOferta(null); });
+$("btn-atualizar-ofertas").addEventListener("click", carregarOfertas);
+$("btn-ver-site").addEventListener("click", function () {
+  window.open("https://clube-diana.onrender.com/#ofertas", "_blank");
+});
+
+carregarOfertas();
 
 carregarRelatorio();
 carregar();

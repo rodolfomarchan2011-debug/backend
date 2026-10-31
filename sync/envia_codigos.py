@@ -31,6 +31,13 @@ from urllib.parse import urlparse, unquote
 
 import pymysql
 
+# --- quando roda sem console (pythonw/Agendador), print() nao tem para onde ir
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_CANDIDATES = [
     os.path.join(ROOT, ".env"),

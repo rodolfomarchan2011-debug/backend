@@ -45,7 +45,7 @@ import pymysql
 import pymysql.cursors
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -271,6 +271,8 @@ LIMITE_LOGIN_IP = RateLimit(15, 600)         # 15 tentativas por 10 min por IP
 LIMITE_LOGIN_CPF = RateLimit(6, 600)         # 6 tentativas por 10 min por CPF
 LIMITE_EXPORT = RateLimit(10, 3600)          # exportar/excluir: 10 por hora
 LIMITE_NEWSLETTER = RateLimit(5, 3600)       # 5 inscricoes por hora por IP
+LIMITE_OFERTAS = RateLimit(120, 60)          # 120 leituras de ofertas por minuto por IP
+LIMITE_OFERTA_IMG = RateLimit(300, 600)      # 300 fotos por 10 min por IP
 
 
 def ip_do_cliente(request: Request) -> str:
@@ -342,7 +344,11 @@ async def cabecalhos_de_seguranca(request: Request, call_next):
     resposta.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
     resposta.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     resposta.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
-    resposta.headers["Cache-Control"] = "no-store"
+    # Ofertas sao conteudo publico e muda pouco: pode ficar 60 s no cache do
+    # navegador (o endpoint define o max-age). O resto continua no-store.
+    caminho = request.url.path
+    if caminho != "/api/ofertas" and not caminho.startswith("/api/ofertas/imagem/"):
+        resposta.headers["Cache-Control"] = "no-store"
     try:
         del resposta.headers["server"]
     except KeyError:
@@ -373,6 +379,86 @@ def health():
                             content={"ok": False, "service": "clube-diana-api",
                                      "db": "down"})
     return {"ok": True, "service": "clube-diana-api", "db": "up"}
+
+
+# ---------------- ofertas do site ----------------
+# Fonte das ofertas que aparecem em https://clube-diana.onrender.com.
+# Quem EDITA e o painel da loja (backend/painel, roda no PC da loja e grava
+# direto no banco). A API publica so a leitura, sem senha: e conteudo de
+# vitrine. Assim a loja troca oferta sem programador e sem novo deploy.
+
+MIME_IMAGEM = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/svg+xml"}
+
+
+def _imagem_da_oferta(linha) -> str:
+    """Foto da oferta: a enviada pelo painel (fica no banco) ou um arquivo do site."""
+    if linha.get("tem_foto"):
+        return "/api/ofertas/imagem/" + str(linha["id"])
+    return (linha.get("imagem_url") or "").strip()
+
+
+def _oferta_json(linha) -> dict:
+    """Formato que o site consome (o mesmo que o antigo js/ofertas.js)."""
+    desconto = linha.get("desconto")
+    return {
+        "id": str(linha["id"]),
+        "nome": linha["produto"],
+        "descricao": linha.get("descricao") or "",
+        "categoria": linha.get("categoria") or "",
+        "precoDe": float(linha.get("preco_de") or 0),
+        "precoPor": float(linha.get("preco_por") or 0),
+        "unidade": linha.get("unidade") or "kg",
+        "desconto": int(desconto) if desconto is not None else 0,
+        "imagem": _imagem_da_oferta(linha),
+        "destaque": bool(linha.get("destaque")),
+    }
+
+
+@app.get("/api/ofertas")
+def ofertas(request: Request):
+    exigir_limite(LIMITE_OFERTAS, f"ofertas:{ip_do_cliente(request)}")
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,produto,descricao,categoria,preco_de,preco_por,unidade,"
+                "desconto,imagem_url,(imagem_bytes IS NOT NULL) AS tem_foto,destaque "
+                "FROM ofertas WHERE ativo=1 ORDER BY ordem, criado_em")
+            linhas = cur.fetchall()
+            cur.execute("SELECT MAX(atualizado_em) AS m FROM ofertas WHERE ativo=1")
+            linha = cur.fetchone() or {}
+            atualizado = linha.get("m")
+    finally:
+        conn.close()
+    corpo = {
+        "ofertas": [_oferta_json(l) for l in linhas],
+        "atualizado_em": atualizado.strftime("%Y-%m-%d %H:%M:%S") if atualizado else None,
+    }
+    return JSONResponse(content=corpo, headers={"Cache-Control": "public, max-age=60"})
+
+
+@app.get("/api/ofertas/imagem/{oferta_id}")
+def oferta_imagem(oferta_id: str, request: Request):
+    exigir_limite(LIMITE_OFERTA_IMG, f"oferta-img:{ip_do_cliente(request)}")
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT imagem_bytes, imagem_mime FROM ofertas WHERE id=%s",
+                        (oferta_id,))
+            linha = cur.fetchone()
+    finally:
+        conn.close()
+    if not linha or not linha.get("imagem_bytes"):
+        raise HTTPException(404, "Esta oferta nao tem foto")
+    dados = bytes(linha["imagem_bytes"])
+    mime = linha.get("imagem_mime") or "image/jpeg"
+    if mime not in MIME_IMAGEM:
+        mime = "image/jpeg"
+    etag = '"%s"' % hashlib.sha1(dados).hexdigest()[:24]
+    cache = {"Cache-Control": "public, max-age=86400", "ETag": etag}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=cache)
+    return Response(content=dados, media_type=mime, headers=cache)
 
 
 @app.post("/api/auth/register")

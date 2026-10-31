@@ -36,6 +36,13 @@ import pymysql
 import psycopg2
 import psycopg2.extras
 
+# --- quando roda sem console (pythonw/Agendador), print() nao tem para onde ir
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_CANDIDATES = [
     os.path.join(ROOT, ".env"),
@@ -586,7 +593,7 @@ def main():
         if not args.dry_run:
             alertar_se_preciso(registrar_falhas(env, sucesso=not tecnico),
                                "Confira se o SIM e o banco estao acessiveis.")
-        return 1 if (erros or tecnico) else 0
+        return 1 if tecnico else 0  # erro de cadastro nao e falha tecnica
     finally:
         soltar_lock()
 
