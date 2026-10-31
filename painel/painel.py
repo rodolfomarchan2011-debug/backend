@@ -26,7 +26,10 @@ import pymysql
 import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+import csv
+import io as _io
+
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -167,6 +170,153 @@ def adesao(dias: int = 7):
         "total": {"vendas": total_v, "com_cpf": total_c,
                   "pct": round(100.0 * total_c / total_v, 1) if total_v else 0},
     }
+
+
+SQL_ADESAO_MES = SQL_ADESAO.replace(
+    'WHERE l."DataLancamento" >= now() - make_interval(days => %s)',
+    'WHERE l."DataLancamento" >= %s AND l."DataLancamento" < %s'
+).replace(
+    """SELECT to_char(dt::date, 'DD/MM') AS dia,
+       count(*) AS vendas,
+       sum(CASE WHEN COALESCE(cpf,'') <> '' THEN 1 ELSE 0 END) AS com_cpf
+FROM base
+GROUP BY dt::date
+ORDER BY dt::date""",
+    """SELECT count(*) AS vendas,
+       sum(CASE WHEN COALESCE(cpf,'') <> '' THEN 1 ELSE 0 END) AS com_cpf
+FROM base""")
+
+
+def _mes(mes):
+    """YYYY-MM -> (primeiro dia, primeiro dia do mes seguinte)."""
+    try:
+        partes = str(mes)[:7].split("-")
+        inicio = datetime(int(partes[0]), int(partes[1]), 1)
+    except Exception:
+        raise HTTPException(400, "Mes invalido")
+    if inicio.month == 12:
+        fim = datetime(inicio.year + 1, 1, 1)
+    else:
+        fim = datetime(inicio.year, inicio.month + 1, 1)
+    return inicio, fim
+
+
+@app.get("/api/relatorio")
+def relatorio(mes: str | None = None):
+    """Numeros do mes: clientes, compras, economia, top clientes e adesao."""
+    referencia = mes or datetime.now().strftime("%Y-%m")
+    inicio, fim = _mes(referencia)
+
+    db = conn()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS total, SUM(criado_em >= %s) AS novos, "
+                        "SUM(sync_status='sincronizado') AS no_pdv "
+                        "FROM clientes WHERE excluido_em IS NULL", (inicio,))
+            cli = cur.fetchone() or {}
+            cur.execute("SELECT COUNT(*) AS compras, COUNT(DISTINCT cliente_id) AS clientes, "
+                        "COALESCE(SUM(total_liquido),0) AS valor, "
+                        "COALESCE(SUM(total_desconto),0) AS desconto FROM compras "
+                        "WHERE data_venda >= %s AND data_venda < %s", (inicio, fim))
+            comp = cur.fetchone() or {}
+            cur.execute("SELECT c.nome, c.cpf, COUNT(*) AS compras, "
+                        "COALESCE(SUM(k.total_liquido),0) AS valor, "
+                        "COALESCE(SUM(k.total_desconto),0) AS desconto "
+                        "FROM compras k JOIN clientes c ON c.id=k.cliente_id "
+                        "WHERE k.data_venda >= %s AND k.data_venda < %s "
+                        "GROUP BY c.id ORDER BY valor DESC LIMIT 5", (inicio, fim))
+            top = cur.fetchall()
+            cur.execute("SELECT COUNT(*) AS n FROM compras")
+            historico = int(cur.fetchone()["n"])
+    finally:
+        db.close()
+
+    adesao = {"vendas": 0, "com_cpf": 0, "pct": 0.0}
+    try:
+        sim = sim_conn()
+        try:
+            with sim.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as pc:
+                pc.execute(SQL_ADESAO_MES, (inicio, fim))
+                linha = pc.fetchone() or {}
+            vendas = int(linha.get("vendas") or 0)
+            com = int(linha.get("com_cpf") or 0)
+            adesao = {"vendas": vendas, "com_cpf": com,
+                      "pct": round(100.0 * com / vendas, 1) if vendas else 0.0}
+        finally:
+            sim.close()
+    except Exception:
+        adesao["erro"] = "SIM indisponivel"
+
+    return {
+        "ok": True,
+        "mes": referencia,
+        "clientes": {"total": int(cli.get("total") or 0),
+                     "novos": int(cli.get("novos") or 0),
+                     "no_pdv": int(cli.get("no_pdv") or 0)},
+        "compras": {"qtd": int(comp.get("compras") or 0),
+                    "clientes": int(comp.get("clientes") or 0),
+                    "valor": float(comp.get("valor") or 0),
+                    "desconto": float(comp.get("desconto") or 0)},
+        "top": [{"nome": r["nome"], "cpf": fmt_cpf(r["cpf"]),
+                 "compras": int(r["compras"]), "valor": float(r["valor"]),
+                 "desconto": float(r["desconto"])} for r in top],
+        "adesao": adesao,
+        "compras_historico": historico,
+    }
+
+
+@app.get("/api/exportar")
+def exportar(tipo: str = "clientes", de: str | None = None, ate: str | None = None):
+    """CSV para o Excel (separador ';' e BOM, abre certo em pt-BR)."""
+    tipo = (tipo or "").lower()
+    db = conn()
+    try:
+        with db.cursor() as cur:
+            if tipo == "clientes":
+                cur.execute("SELECT nome,cpf,telefone,email,data_nascimento,criado_em,"
+                            "sync_status,last_synced_at FROM clientes "
+                            "WHERE excluido_em IS NULL ORDER BY criado_em")
+                colunas = ["nome", "cpf", "telefone", "email", "data_nascimento",
+                           "criado_em", "sync_status", "last_synced_at"]
+                linhas = cur.fetchall()
+            elif tipo == "compras":
+                condicoes, params = ["1=1"], []
+                if de:
+                    condicoes.append("k.data_venda >= %s")
+                    params.append(de)
+                if ate:
+                    condicoes.append("k.data_venda < DATE_ADD(%s, INTERVAL 1 DAY)")
+                    params.append(ate)
+                cur.execute(
+                    "SELECT k.data_venda, c.nome, c.cpf, k.cupom, k.total_produtos, "
+                    "k.total_desconto, k.total_liquido FROM compras k "
+                    "JOIN clientes c ON c.id=k.cliente_id WHERE " +
+                    " AND ".join(condicoes) + " ORDER BY k.data_venda DESC",
+                    tuple(params))
+                colunas = ["data_venda", "nome", "cpf", "cupom", "total_produtos",
+                           "total_desconto", "total_liquido"]
+                linhas = cur.fetchall()
+            else:
+                raise HTTPException(400, "Tipo invalido (use clientes ou compras)")
+    finally:
+        db.close()
+
+    buf = _io.StringIO()
+    escritor = csv.writer(buf, delimiter=";")
+    escritor.writerow(colunas)
+    for linha in linhas:
+        valores = []
+        for c in colunas:
+            v = linha.get(c)
+            if isinstance(v, datetime):
+                v = v.strftime("%d/%m/%Y %H:%M")
+            valores.append("" if v is None else v)
+        escritor.writerow(valores)
+
+    nome = "%s-%s.csv" % (tipo, datetime.now().strftime("%Y%m%d-%H%M"))
+    return Response(content=buf.getvalue().encode("utf-8-sig"),
+                    media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="%s"' % nome})
 
 
 class Id(BaseModel):
@@ -385,6 +535,16 @@ HTML = """<!doctype html>
   .barra-dia .trilho i{display:block;height:100%;background:#a4161a}
   .barra-dia .trilho i.ok{background:#2e7d32}
   .barra-dia .num{width:130px;text-align:right;color:#7a6b59}
+  .mes-input{font:inherit;padding:8px 10px;border:1px solid var(--linha);border-radius:10px;background:#fff}
+  .rel-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:14px}
+  .rel-item{border:1px solid var(--linha);border-radius:10px;padding:10px 12px;background:#fffdfa}
+  .rel-item .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#8a7b69;font-weight:700}
+  .rel-item .val{font-size:20px;font-weight:700;margin-top:4px}
+  .rel-item .val.alerta{color:#a4161a}
+  .rel-sub{font-size:12px;color:#8a7b69;margin:0 0 10px}
+  table.rel{width:100%;border-collapse:collapse;font-size:13px}
+  table.rel th,table.rel td{padding:7px 8px;border-bottom:1px solid var(--linha);text-align:left}
+  table.rel th{font-size:10px;text-transform:uppercase;color:#7a6b59}
 </style>
 </head>
 <body>
@@ -424,6 +584,15 @@ HTML = """<!doctype html>
   <h2 class="secao">Adesao do CPF no caixa</h2>
   <p class="dica">Vendas em que o caixa identificou o cliente. Se o operador nao escolhe o cliente (ou digita o CPF), a compra nao aparece no painel do cliente.</p>
   <div id="adesao" class="adesao">carregando...</div>
+
+  <h2 class="secao">Relatorio do mes</h2>
+  <div class="barra">
+    <input type="month" id="rel-mes" class="mes-input">
+    <button id="btn-rel">Atualizar</button>
+    <button id="btn-csv-clientes">Baixar clientes (CSV)</button>
+    <button id="btn-csv-compras">Baixar compras do mes (CSV)</button>
+  </div>
+  <div id="relatorio" class="adesao">carregando...</div>
 
   <div class="rodape">
     <span id="f-tarefa">tarefa: -</span>
@@ -593,6 +762,68 @@ function carregarAdesao() {
   });
 }
 
+function dinheiro(v) {
+  return "R$ " + (v || 0).toFixed(2).replace(".", ",").replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+}
+
+function carregarRelatorio() {
+  var campo = document.getElementById("rel-mes");
+  var mes = campo && campo.value ? campo.value : new Date().toISOString().slice(0, 7);
+  if (campo && !campo.value) campo.value = mes;
+  fetch("/api/relatorio?mes=" + mes).then(function (r) { return r.json(); }).then(function (d) {
+    var alvo = document.getElementById("relatorio");
+    if (!d.ok) { alvo.textContent = "Nao foi possivel carregar."; return; }
+    var a = d.adesao || {};
+    var html = "<div class='rel-grid'>" +
+      "<div class='rel-item'><div class='lbl'>Clientes</div><div class='val'>" + d.clientes.total +
+        "</div><div class='rel-sub'>" + d.clientes.novos + " novos no mes</div></div>" +
+      "<div class='rel-item'><div class='lbl'>No PDV</div><div class='val'>" + d.clientes.no_pdv +
+        "</div><div class='rel-sub'>vinculados ao SIM</div></div>" +
+      "<div class='rel-item'><div class='lbl'>Compras no mes</div><div class='val'>" + d.compras.qtd +
+        "</div><div class='rel-sub'>" + d.compras.clientes + " clientes compraram</div></div>" +
+      "<div class='rel-item'><div class='lbl'>Economia gerada</div><div class='val'>" + dinheiro(d.compras.desconto) +
+        "</div><div class='rel-sub'>total vendido " + dinheiro(d.compras.valor) + "</div></div>" +
+      "<div class='rel-item'><div class='lbl'>Adesao do CPF</div><div class='val" +
+        ((a.pct || 0) < 30 ? " alerta" : "") + "'>" + (a.pct || 0) + "%</div><div class='rel-sub'>" +
+        (a.vendas || 0) + " vendas no mes</div></div>" +
+      "</div>";
+
+    if (d.top && d.top.length) {
+      html += "<table class='rel'><thead><tr><th>Cliente</th><th>CPF</th><th>Compras</th>" +
+        "<th>Gasto</th><th>Economia</th></tr></thead><tbody>";
+      d.top.forEach(function (c) {
+        html += "<tr><td>" + c.nome + "</td><td>" + c.cpf + "</td><td>" + c.compras +
+          "</td><td>" + dinheiro(c.valor) + "</td><td>" + dinheiro(c.desconto) + "</td></tr>";
+      });
+      html += "</tbody></table>";
+    } else {
+      html += "<p class='rel-sub'>Nenhuma compra vinculada neste mes.</p>";
+    }
+    alvo.innerHTML = html;
+  }).catch(function () {
+    document.getElementById("relatorio").textContent = "Sem conexao com o banco.";
+  });
+}
+
+document.getElementById("btn-rel").addEventListener("click", carregarRelatorio);
+document.getElementById("rel-mes").addEventListener("change", carregarRelatorio);
+
+function baixarCsv(tipo) {
+  var mes = document.getElementById("rel-mes").value || new Date().toISOString().slice(0, 7);
+  var url = "/api/exportar?tipo=" + tipo;
+  if (tipo === "compras") {
+    var partes = mes.split("-");
+    var ano = parseInt(partes[0], 10), m = parseInt(partes[1], 10);
+    var ultimo = new Date(ano, m, 0).getDate();
+    url += "&de=" + mes + "-01&ate=" + mes + "-" + ("0" + ultimo).slice(-2);
+  }
+  window.location.href = url;
+}
+
+document.getElementById("btn-csv-clientes").addEventListener("click", function () { baixarCsv("clientes"); });
+document.getElementById("btn-csv-compras").addEventListener("click", function () { baixarCsv("compras"); });
+
+carregarRelatorio();
 carregar();
 carregarAdesao();
 setInterval(carregar, 30000);

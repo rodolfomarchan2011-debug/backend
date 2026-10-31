@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Cartaz do caixa — Clube Diana</title>
+<style>
+  @page { size: A4; margin: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 210mm; height: 297mm;
+    font-family: "Segoe UI", Roboto, Arial, sans-serif;
+    background: #faf6ef; color: #2b1d16;
+    display: flex; flex-direction: column;
+  }
+  .topo {
+    background: #2b1d16; color: #fff;
+    padding: 14mm 16mm 12mm;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .marca { display: flex; align-items: center; gap: 6mm; }
+  .selo {
+    width: 18mm; height: 18mm; border-radius: 50%;
+    border: 1.2mm solid #d4a017; color: #d4a017;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 9mm; font-weight: 800;
+  }
+  .marca strong { display: block; font-size: 7mm; letter-spacing: .08em; }
+  .marca small { display: block; font-size: 3.4mm; letter-spacing: .22em; color: #d4a017; margin-top: 1mm; }
+  .clube { text-align: right; font-size: 3.6mm; letter-spacing: .18em; color: #e9dcc7; }
+
+  .centro { flex: 1; padding: 12mm 16mm 10mm; display: flex; flex-direction: column; }
+  .chamada {
+    font-size: 5mm; letter-spacing: .3em; color: #a4161a; font-weight: 700;
+    margin-bottom: 6mm;
+  }
+  h1 {
+    font-size: 20mm; line-height: 1.04; font-weight: 800;
+    letter-spacing: -.01em; margin-bottom: 5mm;
+  }
+  h1 span { color: #a4161a; }
+  .sub {
+    font-size: 5.2mm; line-height: 1.35; color: #4a4038;
+    max-width: 150mm; margin-bottom: 12mm;
+  }
+
+  .passos { display: flex; flex-direction: column; gap: 6mm; }
+  .passo { display: flex; gap: 6mm; align-items: flex-start; }
+  .num {
+    flex: none; width: 12mm; height: 12mm; border-radius: 50%;
+    background: #a4161a; color: #fff; font-weight: 800; font-size: 6mm;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .passo strong { display: block; font-size: 5.6mm; line-height: 1.2; }
+  .passo small { display: block; font-size: 3.9mm; color: #6b5d4e; margin-top: 1.5mm; line-height: 1.3; }
+
+  .rodape {
+    background: #a4161a; color: #fff;
+    padding: 9mm 16mm; margin-top: auto;
+  }
+  .rodape .forte { font-size: 5.4mm; font-weight: 800; line-height: 1.25; }
+  .rodape .fraco { font-size: 3.8mm; opacity: .92; margin-top: 2.5mm; }
+  .rodape .site { font-size: 4.6mm; font-weight: 700; letter-spacing: .04em; margin-top: 4mm; }
+  .dica {
+    margin-top: auto;
+    border-left: 1.6mm solid #d4a017;
+    background: #fffdf8;
+    padding: 7mm 8mm;
+  }
+  .dica strong { display: block; font-size: 4.4mm; margin-bottom: 2mm; }
+  .dica span { font-size: 3.9mm; line-height: 1.35; color: #4a4038; }
+</style>
+</head>
+<body>
+  <header class="topo">
+    <div class="marca">
+      <div class="selo">D</div>
+      <div>
+        <strong>DIANA</strong>
+        <small>CASA DE CARNES</small>
+      </div>
+    </div>
+    <div class="clube">CLUBE DE VANTAGENS</div>
+  </header>
+
+  <main class="centro">
+    <p class="chamada">ATENÇÃO, CAIXA</p>
+    <h1>PEÇA O CPF<br>EM <span>TODA VENDA</span></h1>
+    <p class="sub">
+      É pelo CPF que a compra entra no clube do cliente — e é ali que ele vê
+      quanto economizou. Sem o CPF, a compra não existe para ele.
+    </p>
+
+    <div class="passos">
+      <div class="passo">
+        <div class="num">1</div>
+        <div>
+          <strong>Pergunte: “o senhor tem o Clube Diana?”</strong>
+          <small>Se não tiver, explique que o cadastro é gratuito e leva 1 minuto no site.</small>
+        </div>
+      </div>
+      <div class="passo">
+        <div class="num">2</div>
+        <div>
+          <strong>Digite o CPF na venda</strong>
+          <small>No sistema, escolha o cliente pelo CPF antes de finalizar o cupom.</small>
+        </div>
+      </div>
+      <div class="passo">
+        <div class="num">3</div>
+        <div>
+          <strong>O desconto aparece no cupom</strong>
+          <small>O cliente recebe a confirmação no WhatsApp e vê a economia no painel dele.</small>
+        </div>
+      </div>
+    </div>
+
+    <div class="dica">
+      <strong>Por que isso importa?</strong>
+      <span>
+        Com o CPF, o cliente vê a economia dele no painel do clube e recebe a
+        confirmação no WhatsApp. Sem o CPF, ele nunca sabe quanto ganhou — e o
+        clube deixa de fazer sentido para ele.
+      </span>
+    </div>
+  </main>
+
+  <footer class="rodape">
+    <div class="forte">Sem o CPF, o desconto do clube não acontece.</div>
+    <div class="fraco">Dúvida? Fale com o responsável da loja.</div>
+    <div class="site">CLUBE-DIANA.ONRENDER.COM</div>
+  </footer>
+</body>
+</html>
