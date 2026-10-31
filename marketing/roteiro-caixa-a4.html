@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Roteiro do caixa — Clube Diana</title>
+<style>
+  @page { size: A4; margin: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 210mm; height: 297mm;
+    font-family: "Segoe UI", Roboto, Arial, sans-serif;
+    background: #fff; color: #2b1d16;
+    padding: 14mm 15mm;
+    font-size: 3.6mm; line-height: 1.35;
+  }
+  header { display: flex; align-items: center; gap: 6mm; border-bottom: 1.2mm solid #a4161a; padding-bottom: 5mm; }
+  .bolinha {
+    width: 14mm; height: 14mm; border-radius: 50%;
+    border: 1mm solid #d4a017; color: #d4a017;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 7mm; font-weight: 800;
+  }
+  header strong { display: block; font-size: 6mm; letter-spacing: .05em; }
+  header small { display: block; font-size: 3.2mm; color: #6b5d4e; letter-spacing: .12em; }
+  header .tag {
+    margin-left: auto; background: #2b1d16; color: #fff; border-radius: 2mm;
+    padding: 2mm 4mm; font-size: 3mm; letter-spacing: .1em; font-weight: 700;
+  }
+  h1 { font-size: 8mm; margin: 6mm 0 2mm; }
+  .sub { font-size: 3.8mm; color: #4a4038; margin-bottom: 6mm; }
+  h2 {
+    font-size: 4mm; margin: 6mm 0 2.5mm; color: #a4161a;
+    text-transform: uppercase; letter-spacing: .08em;
+  }
+  ul { margin-left: 5mm; }
+  li { margin-bottom: 2mm; }
+  li b { color: #2b1d16; }
+  .fala {
+    background: #faf6ef; border-left: 1.4mm solid #d4a017;
+    padding: 3mm 4mm; margin: 2mm 0; font-style: italic;
+  }
+  .duas { display: flex; gap: 6mm; }
+  .duas > div { flex: 1; }
+  .nao li::marker { color: #a4161a; }
+  .sim li::marker { color: #2e7d32; }
+  .rodape {
+    margin-top: 5mm; border-top: 0.4mm solid #d9cbb6; padding-top: 4mm;
+    font-size: 3.2mm; color: #6b5d4e; display: flex; justify-content: space-between;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="bolinha">D</div>
+    <div>
+      <strong>DIANA · CLUBE DE VANTAGENS</strong>
+      <small>CASA DE CARNES</small>
+    </div>
+    <div class="tag">TREINAMENTO DO CAIXA</div>
+  </header>
+
+  <h1>Roteiro de 1 minuto por venda</h1>
+  <p class="sub">
+    O clube só existe quando o CPF entra na venda. Sem CPF, o cliente não vê
+    desconto, não vê economia e não volta pelo clube.
+  </p>
+
+  <h2>O que falar</h2>
+  <div class="fala">“O senhor tem o Clube Diana? Se tiver, me passa o CPF que já entra o desconto.”</div>
+  <ul class="sim">
+    <li><b>Se não tiver:</b> “É grátis, sem mensalidade. Dá pra fazer em 1 minuto no site ou aqui com o atendente.”</li>
+    <li><b>Se não quiser informar:</b> “Sem problema, sigo a venda normal.” — e siga. Nunca insista duas vezes.</li>
+  </ul>
+
+  <h2>O que fazer no sistema</h2>
+  <ul class="sim">
+    <li><b>1.</b> Antes de finalizar o cupom, localize o cliente pelo <b>CPF</b>.</li>
+    <li><b>2.</b> Confirme o nome na tela (evita CPF de outra pessoa).</li>
+    <li><b>3.</b> Finalize. O desconto do clube aparece no cupom.</li>
+  </ul>
+
+  <h2>O que não fazer</h2>
+  <ul class="nao">
+    <li>Não digite CPF de outra pessoa (marido, filho, amigo): a compra vai para a conta errada.</li>
+    <li>Não invente número. CPF errado não gera desconto e ainda vira erro no sistema.</li>
+    <li>Não prometa desconto que não apareceu no cupom.</li>
+    <li>Não crie cadastro com CPF de terceiro sem a pessoa estar presente.</li>
+  </ul>
+
+  <h2>Se der problema</h2>
+  <div class="duas">
+    <div>
+      <ul>
+        <li><b>Cliente não tem cadastro:</b> mande para o site ou cadastre com ele do lado.</li>
+        <li><b>CPF não aparece no sistema:</b> o cadastro pode não ter chegado ao PDV ainda (leva até 15 min). Avise o responsável.</li>
+      </ul>
+    </div>
+    <div>
+      <ul>
+        <li><b>Esqueceu a senha:</b> no site, “Esqueci minha senha” — chega um código no WhatsApp.</li>
+        <li><b>Dúvida no desconto:</b> confira a oferta do dia. O clube não é desconto em tudo.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>Onde conferir se está funcionando</h2>
+  <ul>
+    <li>Painel da loja → <b>“Adesão do CPF no caixa”</b>: mostra o % de vendas identificadas por dia.</li>
+    <li>Meta inicial: <b>sair de 0% e chegar a 30%</b> em uma semana.</li>
+  </ul>
+
+  <div class="rodape">
+    <span>Dúvida: falar com o responsável da loja</span>
+    <span>CLUBE-DIANA.ONRENDER.COM</span>
+  </div>
+</body>
+</html>

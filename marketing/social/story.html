@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<style>
+  @page { size: 1080px 1920px; margin: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 1080px; height: 1920px;
+    font-family: "Segoe UI", Roboto, Arial, sans-serif;
+    background: #faf6ef; color: #2b1d16;
+    display: flex; flex-direction: column; padding: 80px 72px;
+    border-top: 28px solid #a4161a;
+    border-bottom: 28px solid #2b1d16;
+  }
+  .clube { font-size: 28px; letter-spacing: .3em; color: #a4161a; font-weight: 700; }
+  h1 { font-size: 150px; line-height: .92; font-weight: 800; margin: 46px 0 30px; letter-spacing: -.03em; }
+  h1 span { color: #a4161a; }
+  .sub { font-size: 42px; line-height: 1.25; color: #4a4038; max-width: 900px; }
+  ul { list-style: none; margin-top: 60px; display: flex; flex-direction: column; gap: 34px; }
+  li { display: flex; gap: 24px; font-size: 38px; line-height: 1.25; align-items: flex-start; }
+  li b { color: #a4161a; }
+  .marca {
+    margin-top: 42px; display: flex; align-items: center; gap: 22px;
+    border-top: 3px solid #e4d6bf; padding-top: 40px;
+  }
+  .qr {
+    margin-top: auto; display: flex; align-items: center; gap: 30px;
+  }
+  .qr img { width: 240px; height: 240px; border-radius: 20px; background: #fff; }
+  .qr span { font-size: 36px; line-height: 1.25; color: #4a4038; max-width: 420px; }
+  .qr b { display: block; font-size: 40px; color: #a4161a; }
+  .bolinha {
+    width: 110px; height: 110px; border-radius: 50%;
+    border: 8px solid #d4a017; color: #d4a017;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 54px; font-weight: 800;
+  }
+  .marca strong { display: block; font-size: 40px; letter-spacing: .06em; }
+  .marca small { display: block; font-size: 26px; color: #6b5d4e; }
+  .cta {
+    margin-left: auto; background: #a4161a; color: #fff; border-radius: 99px;
+    padding: 22px 36px; font-size: 30px; font-weight: 700;
+  }
+</style>
+</head>
+<body>
+  <div class="clube">CLUBE DE VANTAGENS</div>
+  <h1>ATÉ<br><span>30%</span><br>DE DESCONTO</h1>
+  <p class="sub">Nos cortes do clube, toda semana. Sem mensalidade e sem cartão.</p>
+
+  <ul>
+    <li><b>·</b><span>Cadastro grátis em 1 minuto</span></li>
+    <li><b>·</b><span>Desconto aplicado no cupom pelo CPF</span></li>
+    <li><b>·</b><span>Histórico de economia só para você</span></li>
+  </ul>
+
+  <div class="qr">
+    <img src="../qr-site.png" alt="QR code do Clube Diana">
+    <span><b>Aponte a câmera</b> e faça parte em 1 minuto.</span>
+  </div>
+
+  <div class="marca">
+    <div class="bolinha">D</div>
+    <div>
+      <strong>DIANA</strong>
+      <small>CASA DE CARNES</small>
+    </div>
+    <div class="cta">CLUBE-DIANA.ONRENDER.COM</div>
+  </div>
+</body>
+</html>

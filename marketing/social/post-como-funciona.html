@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<style>
+  @page { size: 1080px 1080px; margin: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 1080px; height: 1080px;
+    font-family: "Segoe UI", Roboto, Arial, sans-serif;
+    background: #2b1d16; color: #fff;
+    display: flex; flex-direction: column; padding: 64px;
+    position: relative; overflow: hidden;
+  }
+  .marca-dagua {
+    position: absolute; right: -60px; bottom: 20px;
+    font-size: 620px; font-weight: 800; line-height: 1;
+    color: #352a21; pointer-events: none; user-select: none;
+  }
+  .clube { font-size: 24px; letter-spacing: .28em; color: #d4a017; font-weight: 700; }
+  h1 { font-size: 86px; line-height: 1; font-weight: 800; margin: 26px 0 44px; }
+  .passos { display: flex; flex-direction: column; gap: 34px; }
+  .passo { display: flex; gap: 26px; align-items: flex-start; }
+  .num {
+    flex: none; width: 74px; height: 74px; border-radius: 50%;
+    background: #a4161a; color: #fff; font-size: 36px; font-weight: 800;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .passo strong { display: block; font-size: 40px; line-height: 1.15; }
+  .passo small { display: block; font-size: 28px; color: #d9cbb6; margin-top: 8px; line-height: 1.3; }
+  .rodape {
+    margin-top: auto; border-top: 3px solid #4a3a2c; padding-top: 30px;
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 26px; color: #d9cbb6;
+  }
+  .rodape b { color: #d4a017; font-size: 30px; letter-spacing: .04em; }
+</style>
+</head>
+<body>
+  <div class="clube">CLUBE DE VANTAGENS</div>
+  <h1>COMO FUNCIONA</h1>
+  <div class="passos">
+    <div class="passo">
+      <div class="num">1</div>
+      <div>
+        <strong>Cadastre-se no site</strong>
+        <small>Nome, CPF e WhatsApp. Leva 1 minuto e é grátis.</small>
+      </div>
+    </div>
+    <div class="passo">
+      <div class="num">2</div>
+      <div>
+        <strong>Informe o CPF no caixa</strong>
+        <small>Em toda compra, para o desconto entrar no seu cupom.</small>
+      </div>
+    </div>
+    <div class="passo">
+      <div class="num">3</div>
+      <div>
+        <strong>Acompanhe sua economia</strong>
+        <small>Entre no site e veja quanto você já economizou.</small>
+      </div>
+    </div>
+  </div>
+  <div class="rodape">
+    <span>Sem mensalidade · sem cartão</span>
+    <b>CLUBE-DIANA.ONRENDER.COM</b>
+  </div>
+</body>
+</html>
