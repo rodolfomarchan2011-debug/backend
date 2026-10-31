@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -45,6 +46,8 @@ BACKUP_DIR = os.path.join(ROOT, "backups")
 LOG_DIR = os.path.join(ROOT, "logs")
 LOG_PATH = os.path.join(LOG_DIR, "sync.log")
 LOCK_PATH = os.path.join(LOG_DIR, ".sync.lock")
+ALERTA_PATH = os.path.join(LOG_DIR, "ALERTA.txt")
+ALERTA_PS1 = os.path.join(ROOT, "sync", "alerta.ps1")
 MAX_TENTATIVAS = 8
 NS = uuid.UUID("6f1c2d3e-4a5b-4c6d-8e7f-90a1b2c3d4e5")
 
@@ -102,6 +105,84 @@ def soltar_lock():
         os.remove(LOCK_PATH)
     except OSError:
         pass
+
+
+def registrar_falhas(env, sucesso):
+    """Conta falhas tecnicas seguidas (banco/SIM fora, erro inesperado)."""
+    try:
+        my = mysql_conn(club_url(env))
+    except Exception:
+        return 0
+    try:
+        with my.cursor() as cur:
+            cur.execute("SELECT valor FROM sync_control WHERE chave='falhas_consecutivas'")
+            r = cur.fetchone()
+            n = int(r[0]) if r and str(r[0]).isdigit() else 0
+            n = 0 if sucesso else n + 1
+            cur.execute(
+                "INSERT INTO sync_control (chave, valor) VALUES ('falhas_consecutivas', %s) "
+                "ON DUPLICATE KEY UPDATE valor=VALUES(valor)", (str(n),))
+        return n
+    except Exception:
+        return 0
+    finally:
+        my.close()
+
+
+def alertar_se_preciso(n, detalhe=""):
+    """Depois de 3 falhas seguidas: arquivo de alerta + aviso no Windows."""
+    if n >= 3:
+        texto = (f"{datetime.now():%d/%m/%Y %H:%M} - {n} falhas seguidas na sincronizacao.\n"
+                 f"{detalhe}\nAbra o painel da loja: backend\\painel\\painel.bat")
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(ALERTA_PATH, "w", encoding="utf-8") as fh:
+                fh.write(texto)
+        except OSError:
+            pass
+        if os.path.isfile(ALERTA_PS1):
+            try:
+                subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                                "-File", ALERTA_PS1], timeout=20, capture_output=True)
+            except Exception:
+                pass
+    elif os.path.isfile(ALERTA_PATH):
+        try:
+            os.remove(ALERTA_PATH)
+        except OSError:
+            pass
+
+
+def backup_automatico(env, forcar=False):
+    """Faz backup do banco do clube a cada 7 dias (ou quando --backup)."""
+    ultimo = None
+    try:
+        my = mysql_conn(club_url(env))
+        try:
+            with my.cursor() as cur:
+                cur.execute("SELECT valor FROM sync_control WHERE chave='backup_ultimo'")
+                r = cur.fetchone()
+                ultimo = r[0] if r else None
+        finally:
+            my.close()
+    except Exception:
+        return
+
+    if ultimo and not forcar:
+        try:
+            if datetime.now() - datetime.fromisoformat(ultimo) < timedelta(days=7):
+                return
+        except ValueError:
+            pass
+
+    script = os.path.join(ROOT, "scripts", "backup_clube.py")
+    try:
+        r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                           timeout=240, encoding="utf-8", errors="ignore")
+        linhas = (r.stdout or r.stderr or "").strip().splitlines()
+        log("[backup] " + (linhas[-1] if linhas else "concluido"))
+    except Exception as exc:
+        log(f"[backup] falhou: {type(exc).__name__}")
 
 
 def club_url(env):
@@ -463,6 +544,7 @@ def main():
     ap.add_argument("--pull-compras", action="store_true")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--backup", action="store_true", help="faz o backup agora e sai")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--cpf", default=None, help="sincroniza so este CPF")
     ap.add_argument("--forcar", action="store_true",
@@ -476,6 +558,10 @@ def main():
         status(env)
         return 0
 
+    if args.backup:
+        backup_automatico(env, forcar=True)
+        return 0
+
     if not (args.all or args.push_cadastros or args.pull_compras):
         ap.print_help()
         return 0
@@ -483,13 +569,24 @@ def main():
     if not pegar_lock():
         return 0
     try:
-        erros = 0
-        if args.all or args.push_cadastros:
-            erros += push_cadastros(env, args.dry_run,
-                                    only_digits(args.cpf) or None, args.forcar)
-        if args.all or args.pull_compras:
-            erros += pull_compras(env, args.dry_run, args.dias)
-        return 1 if erros else 0
+        if not args.dry_run:
+            backup_automatico(env)
+
+        erros, tecnico = 0, False
+        try:
+            if args.all or args.push_cadastros:
+                erros += push_cadastros(env, args.dry_run,
+                                        only_digits(args.cpf) or None, args.forcar)
+            if args.all or args.pull_compras:
+                erros += pull_compras(env, args.dry_run, args.dias)
+        except Exception as exc:
+            tecnico = True
+            log(f"[erro] {type(exc).__name__}: {str(exc)[:200]}")
+
+        if not args.dry_run:
+            alertar_se_preciso(registrar_falhas(env, sucesso=not tecnico),
+                               "Confira se o SIM e o banco estao acessiveis.")
+        return 1 if (erros or tecnico) else 0
     finally:
         soltar_lock()
 

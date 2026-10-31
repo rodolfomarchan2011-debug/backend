@@ -312,9 +312,13 @@ class Inscricao(BaseModel):
     origem: str | None = None
 
 
+class Descadastro(BaseModel):
+    token: str
+
+
 app = FastAPI(
     title="Clube Diana API",
-    version="1.2.0",
+    version="1.3.0",
     docs_url="/docs" if DOCS_ATIVO else None,
     redoc_url="/redoc" if DOCS_ATIVO else None,
     openapi_url="/openapi.json" if DOCS_ATIVO else None,
@@ -605,9 +609,31 @@ def newsletter(body: Inscricao, request: Request):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO newsletter (id,email,origem) VALUES (%s,%s,%s) "
-                "ON DUPLICATE KEY UPDATE origem=VALUES(origem)",
-                (secrets.token_hex(18)[:36], email, (body.origem or "site")[:40]))
+                "INSERT INTO newsletter (id,email,origem,token) VALUES (%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE origem=VALUES(origem), "
+                "token=COALESCE(newsletter.token, VALUES(token))",
+                (secrets.token_hex(18)[:36], email, (body.origem or "site")[:40],
+                 secrets.token_hex(16)))
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.post("/api/newsletter/sair")
+def sair_newsletter(body: Descadastro, request: Request):
+    exigir_limite(LIMITE_NEWSLETTER, f"sair:{ip_do_cliente(request)}")
+    tok = (body.token or "").strip().lower()
+    if not re.match(r"^[a-f0-9]{32}$", tok):
+        raise HTTPException(400, "Link invalido")
+
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM newsletter WHERE token=%s", (tok,))
+            if not cur.fetchone():
+                raise HTTPException(404, "Link invalido ou expirado")
+            cur.execute("UPDATE newsletter SET descadastrado_em=NOW() "
+                        "WHERE token=%s AND descadastrado_em IS NULL", (tok,))
     finally:
         conn.close()
     return {"ok": True}
