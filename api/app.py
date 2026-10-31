@@ -318,7 +318,7 @@ class Descadastro(BaseModel):
 
 app = FastAPI(
     title="Clube Diana API",
-    version="1.3.0",
+    version="1.4.0",
     docs_url="/docs" if DOCS_ATIVO else None,
     redoc_url="/redoc" if DOCS_ATIVO else None,
     openapi_url="/openapi.json" if DOCS_ATIVO else None,
@@ -637,3 +637,101 @@ def sair_newsletter(body: Descadastro, request: Request):
     finally:
         conn.close()
     return {"ok": True}
+
+# ---------------- recuperacao de senha por WhatsApp (Fase 3b) ----------------
+#
+# O codigo de 6 digitos NAO e gerado aqui: ele nasce no PC da loja
+# (sync/envia_codigos.py), que guarda so o hash e envia pelo WhatsApp.
+# Aqui apenas criamos o pedido e conferimos o codigo digitado.
+
+class Esqueci(BaseModel):
+    cpf: str
+
+
+class Redefinir(BaseModel):
+    cpf: str
+    codigo: str
+    senha: str = Field(min_length=6, max_length=100)
+
+
+LIMITE_ESQUECI_CPF = RateLimit(3, 3600)      # 3 pedidos por hora por CPF
+LIMITE_ESQUECI_IP = RateLimit(10, 3600)      # 10 por hora por IP
+LIMITE_REDEFINIR = RateLimit(10, 3600)       # 10 tentativas por hora por IP
+
+MINUTOS_PARA_ENVIAR = 15                     # prazo ate o agente enviar
+TENTATIVAS_CODIGO = 5                        # erros antes de invalidar
+
+
+@app.post("/api/auth/esqueci")
+def esqueci_senha(body: Esqueci, request: Request):
+    """Cria o pedido de codigo. Resposta e sempre igual (nao revela cadastro)."""
+    exigir_limite(LIMITE_ESQUECI_IP, f"esqueci-ip:{ip_do_cliente(request)}")
+    cpf = so_digitos(body.cpf)
+    exigir_limite(LIMITE_ESQUECI_CPF, f"esqueci-cpf:{cpf}")
+
+    resposta = {"ok": True,
+                "mensagem": "Se este CPF tiver cadastro, o codigo chega no WhatsApp "
+                            "em ate 1 minuto."}
+    if not cpf_valido(cpf):
+        return resposta
+
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, telefone, excluido_em FROM clientes WHERE cpf=%s", (cpf,))
+            row = cur.fetchone()
+            if not row or row.get("excluido_em"):
+                return resposta
+            telefone = so_digitos(row.get("telefone") or "")
+            if len(telefone) not in (10, 11):
+                return resposta
+
+            # um pedido por vez
+            cur.execute("UPDATE recuperacao SET usado_em=NOW() "
+                        "WHERE cliente_id=%s AND usado_em IS NULL", (row["id"],))
+            cur.execute(
+                "INSERT INTO recuperacao (id, cliente_id, codigo_hash, telefone, expira_em) "
+                "VALUES (%s,%s,NULL,%s, DATE_ADD(NOW(), INTERVAL %s MINUTE))",
+                (secrets.token_hex(18)[:36], row["id"], telefone, MINUTOS_PARA_ENVIAR))
+    finally:
+        conn.close()
+    return resposta
+
+
+@app.post("/api/auth/redefinir")
+def redefinir_senha(body: Redefinir, request: Request):
+    exigir_limite(LIMITE_REDEFINIR, f"redefinir:{ip_do_cliente(request)}")
+    cpf = so_digitos(body.cpf)
+    codigo = "".join(c for c in (body.codigo or "") if c.isdigit())
+    if not cpf_valido(cpf) or len(codigo) != 6:
+        raise HTTPException(400, "Codigo invalido ou expirado")
+
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, excluido_em FROM clientes WHERE cpf=%s", (cpf,))
+            cli = cur.fetchone()
+            if not cli or cli.get("excluido_em"):
+                raise HTTPException(400, "Codigo invalido ou expirado")
+
+            cur.execute(
+                "SELECT id, codigo_hash, tentativas FROM recuperacao "
+                "WHERE cliente_id=%s AND usado_em IS NULL AND codigo_hash IS NOT NULL "
+                "AND expira_em > NOW() ORDER BY criado_em DESC LIMIT 1", (cli["id"],))
+            reg = cur.fetchone()
+            if not reg or int(reg["tentativas"]) >= TENTATIVAS_CODIGO:
+                raise HTTPException(400, "Codigo invalido ou expirado")
+
+            if not verifica_senha(codigo, reg["codigo_hash"]):
+                cur.execute("UPDATE recuperacao SET tentativas=tentativas+1 WHERE id=%s",
+                            (reg["id"],))
+                raise HTTPException(400, "Codigo invalido ou expirado")
+
+            cur.execute("UPDATE clientes SET senha_hash=%s WHERE id=%s",
+                        (hash_senha(body.senha), cli["id"]))
+            cur.execute("UPDATE recuperacao SET usado_em=NOW() WHERE id=%s", (reg["id"],))
+            cur.execute("UPDATE recuperacao SET usado_em=NOW() "
+                        "WHERE cliente_id=%s AND usado_em IS NULL", (cli["id"],))
+    finally:
+        conn.close()
+    return {"ok": True, "mensagem": "Senha alterada. Entre com a senha nova."}

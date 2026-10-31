@@ -133,6 +133,12 @@ def dados():
             cur.execute("SELECT valor FROM sync_control WHERE chave='falhas_consecutivas'")
             r = cur.fetchone()
             falhas = int(r["valor"]) if r and r["valor"] else 0
+            cur.execute(
+                "SELECT SUM(enviado_em IS NULL AND usado_em IS NULL AND expira_em > NOW()) AS p, "
+                "SUM(erro_envio IS NOT NULL AND criado_em > DATE_SUB(NOW(), INTERVAL 1 DAY)) AS f "
+                "FROM recuperacao")
+            rc = cur.fetchone() or {}
+            codigos = {"pendentes": int(rc.get("p") or 0), "falhas": int(rc.get("f") or 0)}
             cur.execute("SELECT COUNT(*) AS n, SUM(descadastrado_em IS NOT NULL) AS d "
                         "FROM newsletter")
             rn = cur.fetchone() or {}
@@ -181,6 +187,7 @@ def dados():
         "tarefa": tarefa,
         "backup": {"ultimo": lista_bkp[0] if lista_bkp else None, "total": len(lista_bkp)},
         "newsletter": {"total": total_news, "descadastrados": saiu_news},
+        "codigos": codigos,
         "agora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
     }
 
@@ -324,6 +331,7 @@ HTML = """<!doctype html>
     <div class="card erro"><div class="lbl">Com erro</div><div class="val" id="c-erro">-</div></div>
     <div class="card ok"><div class="lbl">No PDV</div><div class="val" id="c-ok">-</div></div>
     <div class="card"><div class="lbl">Newsletter</div><div class="val" id="c-news">-</div></div>
+    <div class="card"><div class="lbl">Codigos de senha</div><div class="val" id="c-codigos">-</div></div>
   </div>
 
   <div class="barra">
@@ -377,6 +385,7 @@ function carregar() {
     $("c-erro").textContent = d.contagem.erro;
     $("c-ok").textContent = d.contagem.sincronizado;
     $("c-news").textContent = d.newsletter.total;
+    $("c-codigos").textContent = d.codigos ? (d.codigos.pendentes + " / " + d.codigos.falhas) : "-";
     $("atualizado").textContent = "atualizado em " + d.agora;
 
     var a = $("alerta");
