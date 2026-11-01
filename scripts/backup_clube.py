@@ -8,6 +8,7 @@ Grava em backend/backups/backup-clube-AAAAMMDD-HHMMSS.json.gz e mantem
 apenas os ultimos arquivos (padrao: 8). Nao apaga nada no banco.
 """
 import argparse
+import base64
 import gzip
 import json
 import os
@@ -79,6 +80,21 @@ def main():
             for tabela in ("clientes", "compras", "newsletter", "sync_control"):
                 cur.execute("SELECT * FROM " + tabela)
                 dados[tabela] = cur.fetchall()
+
+            # Ofertas do site: as fotos vao em base64. Se o conjunto passar de
+            # 8 MB, guarda so os dados (as fotos podem ser reenviadas no painel).
+            cur.execute("SELECT *, LENGTH(imagem_bytes) AS bytes_foto FROM ofertas")
+            ofertas = cur.fetchall()
+            total_fotos = sum(int(o.pop("bytes_foto") or 0) for o in ofertas)
+            incluir_fotos = total_fotos <= 8 * 1024 * 1024
+            for oferta in ofertas:
+                if not incluir_fotos:
+                    oferta.pop("imagem_bytes", None)
+                elif oferta.get("imagem_bytes"):
+                    oferta["imagem_bytes"] = base64.b64encode(
+                        bytes(oferta["imagem_bytes"])).decode("ascii")
+            dados["ofertas"] = ofertas
+            dados["ofertas_fotos_incluidas"] = incluir_fotos
     finally:
         db.close()
 
@@ -98,6 +114,8 @@ def main():
 
     print(f"[backup] {nome} | clientes={len(dados['clientes'])} "
           f"compras={len(dados['compras'])} newsletter={len(dados['newsletter'])} "
+          f"ofertas={len(dados['ofertas'])} "
+          f"fotos={'sim' if dados['ofertas_fotos_incluidas'] else 'nao'} "
           f"({os.path.getsize(caminho)} bytes)")
 
     # marca no banco quando foi o ultimo backup
