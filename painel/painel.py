@@ -1110,9 +1110,15 @@ function dinheiro(v) {
   return "R$ " + (v || 0).toFixed(2).replace(".", ",").replace(/\B(?=(\d{3})+(?!\d))/g, ".");
 }
 
+function mesAtual() {
+  // Data local, nao UTC: com toISOString o dia 31 a noite caia no mes seguinte.
+  var hoje = new Date();
+  return hoje.getFullYear() + "-" + ("0" + (hoje.getMonth() + 1)).slice(-2);
+}
+
 function carregarRelatorio() {
   var campo = document.getElementById("rel-mes");
-  var mes = campo && campo.value ? campo.value : new Date().toISOString().slice(0, 7);
+  var mes = campo && campo.value ? campo.value : mesAtual();
   if (campo && !campo.value) campo.value = mes;
   fetch("/api/relatorio?mes=" + mes).then(function (r) { return r.json(); }).then(function (d) {
     var alvo = document.getElementById("relatorio");
@@ -1153,7 +1159,7 @@ document.getElementById("btn-rel").addEventListener("click", carregarRelatorio);
 document.getElementById("rel-mes").addEventListener("change", carregarRelatorio);
 
 function baixarCsv(tipo) {
-  var mes = document.getElementById("rel-mes").value || new Date().toISOString().slice(0, 7);
+  var mes = document.getElementById("rel-mes").value || mesAtual();
   var url = "/api/exportar?tipo=" + tipo;
   if (tipo === "compras") {
     var partes = mes.split("-");
@@ -1185,7 +1191,7 @@ function carregarOfertas() {
     ofertasCarregadas = d.ofertas || [];
     $("ofertas-resumo").textContent = d.ativas + " no site de " + d.total + " cadastradas";
     if (!ofertasCarregadas.length) {
-      alvo.innerHTML = "<div class='of-vazio'>Nenhuma oferta ainda. Clique em \"Nova oferta\" para publicar a primeira.</div>";
+      alvo.innerHTML = "<div class='of-vazio'>Nenhuma oferta ainda. Clique em 'Nova oferta' para publicar a primeira.</div>";
       return;
     }
     alvo.innerHTML = ofertasCarregadas.map(function (o) {
@@ -1362,7 +1368,9 @@ function mudarAtivo(id, ativo) {
 }
 
 function excluirOferta(id, nome) {
-  if (!confirm("Apagar a oferta \"" + nome + "\"?\n\nSe voce so quer tirar do site, use \"Tirar do site\" - assim ela fica guardada para depois.")) return;
+  var aviso = 'Apagar a oferta "' + nome + '"? Se voce so quer tirar do site, ' +
+    'use "Tirar do site": assim ela fica guardada para depois.';
+  if (!confirm(aviso)) return;
   fetch("/api/ofertas/excluir", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id: id })
