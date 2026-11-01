@@ -606,9 +606,15 @@ def salvar_oferta(body: OfertaEntrada):
         raise HTTPException(400, "Preco do clube invalido")
 
     preco_de = max(0.0, min(float(body.preco_de or 0), 100000))
+    calculado = (round((1 - body.preco_por / preco_de) * 100)
+                 if preco_de > body.preco_por > 0 else 0)
     desconto = body.desconto
     if desconto is None:
-        desconto = round((1 - body.preco_por / preco_de) * 100) if preco_de > body.preco_por else 0
+        desconto = calculado
+    elif abs(int(desconto) - calculado) > 2:
+        # O formulario mandou uma % que nao bate com os precos: o preco manda,
+        # senao o site anuncia -20% numa oferta que so tem 13%.
+        desconto = calculado
     desconto = max(0, min(int(desconto), 100))
 
     unidade = _limpo(body.unidade, 12) or "kg"
@@ -894,8 +900,9 @@ HTML = """<!doctype html>
 
 <dialog id="dlg-oferta">
   <h3 id="of-titulo">Nova oferta</h3>
-  <p class="dica">Preencha como o cliente vai ler no site. O desconto e calculado
-    sozinho quando voce poe o preco normal e o preco do clube.</p>
+  <p class="dica">Preencha como o cliente vai ler no site. As contas sao automaticas:
+    preco normal + preco do clube preenchem a % de desconto; e preco normal + %
+    preenchem o preco do clube. O campo que voce digita manda.</p>
   <form id="of-form" method="dialog">
     <div>
       <label for="of-produto">Produto *</label>
@@ -1241,9 +1248,16 @@ function abrirOferta(id) {
   $("of-categoria").value = o ? (o.categoria || "") : "";
   $("of-descricao").value = o ? (o.descricao || "") : "";
   $("of-unidade").value = o ? (o.unidade || "kg") : "kg";
-  $("of-preco-de").value = o && o.preco_de ? String(o.preco_de).replace(".", ",") : "";
-  $("of-preco-por").value = o ? String(o.preco_por).replace(".", ",") : "";
-  $("of-desconto").value = o && o.desconto ? o.desconto : "";
+  $("of-preco-de").value = o && o.preco_de ? String(o.preco_de) : "";
+  $("of-preco-por").value = o ? String(o.preco_por) : "";
+  // Sempre recalcula a % a partir dos precos: assim nunca fica um "-20%"
+  // antigo num preco que ja mudou (foi o que apareceu na tela do dono).
+  $("of-desconto").value = "";
+  if (o && o.preco_de > 0 && o.preco_por > 0) {
+    $("of-desconto").value = String(Math.round((1 - o.preco_por / o.preco_de) * 100));
+  } else if (o && o.desconto) {
+    $("of-desconto").value = String(o.desconto);
+  }
   $("of-destaque").checked = !!(o && o.destaque);
   $("of-ativo").checked = o ? !!o.ativo : true;
   $("of-foto").value = "";
@@ -1253,22 +1267,60 @@ function abrirOferta(id) {
   $("of-produto").focus();
 }
 
+var calculando = false;
+
 function numeroDoCampo(id) {
-  var v = String($(id).value || "").trim().replace(/\./g, "").replace(",", ".");
+  var bruto = String($(id).value || "").trim();
+  if (!bruto) return 0;
+  // input type=number entrega "89.90"; digitado a mao pode chegar "89,90"
+  var v = bruto.indexOf(",") >= 0
+    ? bruto.replace(/\./g, "").replace(",", ".")
+    : bruto;
   var n = parseFloat(v);
   return isNaN(n) ? 0 : n;
 }
 
-function calcularDesconto() {
+function escreverCampo(id, texto) {
+  calculando = true;
+  $(id).value = texto;
+  calculando = false;
+}
+
+function reaisCampo(valor) {
+  return (Math.round(valor * 100) / 100).toFixed(2);
+}
+
+// Os tres campos se calculam sozinhos:
+//   preco normal + preco do clube  -> desconto (%)
+//   preco normal + desconto (%)    -> preco do clube
+// O campo que voce acabou de digitar manda; os outros dois se ajustam.
+function recalcular(origem) {
+  if (calculando) return;
   var de = numeroDoCampo("of-preco-de");
   var por = numeroDoCampo("of-preco-por");
-  if (de > 0 && por > 0 && de > por) {
-    $("of-desconto").value = Math.round((1 - por / de) * 100);
+  var desconto = numeroDoCampo("of-desconto");
+  var temDesconto = String($("of-desconto").value || "").trim() !== "";
+
+  if (origem === "desconto") {
+    if (de > 0 && temDesconto && desconto >= 0 && desconto <= 100) {
+      escreverCampo("of-preco-por", reaisCampo(de * (1 - desconto / 100)));
+    }
+    return;
+  }
+
+  if (de > 0 && por > 0) {
+    escreverCampo("of-desconto", String(Math.round((1 - por / de) * 100)));
+    return;
+  }
+
+  if (origem === "de" && de > 0 && temDesconto && desconto > 0 && desconto <= 100) {
+    escreverCampo("of-preco-por", reaisCampo(de * (1 - desconto / 100)));
   }
 }
 
-$("of-preco-de").addEventListener("input", calcularDesconto);
-$("of-preco-por").addEventListener("input", calcularDesconto);
+$("of-preco-de").addEventListener("input", function () { recalcular("de"); });
+$("of-preco-por").addEventListener("input", function () { recalcular("por"); });
+$("of-desconto").addEventListener("input", function () { recalcular("desconto"); });
 
 $("of-foto").addEventListener("change", function () {
   var arquivo = this.files && this.files[0];
