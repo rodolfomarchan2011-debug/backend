@@ -393,6 +393,52 @@ def _mark_error(my, cid, msg, tentar=True):
 # ------------------------------------------------------------------
 # 2) SIM -> CLUBE  (compras por CPF)
 # ------------------------------------------------------------------
+def reconciliar_vendas(my, pg, dias=365):
+    """Tira do clube as compras cuja venda nao existe mais no SIM.
+
+    No SIM, venda cancelada e APAGADA da tabela "Venda" (nao ha coluna de
+    status). Sem esta conferencia, a compra cancelada ficaria para sempre no
+    painel do cliente, contando na economia dele.
+    """
+    try:
+        with my.cursor() as cur:
+            cur.execute("SELECT id, sim_venda_id FROM compras "
+                        "WHERE data_venda >= DATE_SUB(NOW(), INTERVAL %s DAY)",
+                        (int(dias),))
+            locais = cur.fetchall()
+    except Exception as exc:
+        log(f"[pull] aviso: nao consegui ler as compras do clube ({type(exc).__name__}).")
+        return 0
+    if not locais:
+        return 0
+
+    ids = [str(linha[1]) for linha in locais]
+    existentes = set()
+    try:
+        with pg.cursor() as pc:
+            for i in range(0, len(ids), 200):
+                pc.execute('SELECT "Id"::text FROM "Venda" WHERE "Id"::text = ANY(%s)',
+                           (ids[i:i + 200],))
+                existentes.update(r[0] for r in pc.fetchall())
+    except Exception as exc:
+        # Se a conferencia falhar, nao apaga nada (melhor manter do que perder
+        # compra boa por causa de um timeout).
+        log(f"[pull] aviso: nao consegui conferir as vendas no SIM "
+            f"({type(exc).__name__}); nada foi removido.")
+        return 0
+
+    sumiram = [linha[0] for linha in locais if str(linha[1]) not in existentes]
+    if not sumiram:
+        return 0
+
+    with my.cursor() as cur:
+        for i in range(0, len(sumiram), 200):
+            cur.executemany("DELETE FROM compras WHERE id=%s",
+                            [(x,) for x in sumiram[i:i + 200]])
+    log(f"[pull] {len(sumiram)} compra(s) cancelada(s) no SIM sairam do clube.")
+    return len(sumiram)
+
+
 def pull_compras(env, dry_run, dias):
     read_url = sim_read_url(env)
     my = mysql_conn(club_url(env))
@@ -456,8 +502,14 @@ def pull_compras(env, dry_run, dias):
                         "total": float(it["TotalLiquido"] or 0),
                     })
 
+        # Compra cancelada no caixa some do SIM; aqui ela tambem sai do clube.
+        removidas = 0
+        if not dry_run:
+            removidas = reconciliar_vendas(my, pg)
+
         if not rows:
-            log(f"[pull] nenhuma venda nova desde {since:%d/%m/%Y}.")
+            log(f"[pull] nenhuma venda nova desde {since:%d/%m/%Y}."
+                + (f" removidas={removidas}" if removidas else ""))
             return 0
 
         max_dt = since
@@ -494,7 +546,8 @@ def pull_compras(env, dry_run, dias):
                     "ON DUPLICATE KEY UPDATE valor=VALUES(valor)",
                     (max_dt.isoformat(),))
         log(f"[pull] desde {since:%d/%m/%Y} vendas_clube={inserted} "
-            f"{'(DRY-RUN, nada gravado)' if dry_run else ''}")
+            f"{'(DRY-RUN, nada gravado)' if dry_run else ''}"
+            + (f" removidas={removidas}" if removidas else ""))
         return 0
     finally:
         pg.close()
