@@ -439,6 +439,63 @@ def reconciliar_vendas(my, pg, dias=365):
     return len(sumiram)
 
 
+def reconciliar_clientes(my, pg):
+    """Cliente apagado no PDV (SIM) tambem sai do clube.
+
+    Regra de seguranca: so apaga a conta do clube quando ela NAO tem compras
+    registradas. Com compras, o cadastro fica (historico) e passa para
+    'ignorado' com o motivo, aparecendo no painel da loja.
+    """
+    try:
+        with my.cursor() as cur:
+            cur.execute("SELECT id, nome, sim_cliente_id FROM clientes "
+                        "WHERE excluido_em IS NULL AND sim_cliente_id IS NOT NULL")
+            vinculados = cur.fetchall()
+    except Exception as exc:
+        log(f"[pull] aviso: nao consegui ler os clientes do clube ({type(exc).__name__}).")
+        return 0
+    if not vinculados:
+        return 0
+
+    ids = [str(linha[2]) for linha in vinculados]
+    existentes = set()
+    try:
+        with pg.cursor() as pc:
+            for i in range(0, len(ids), 200):
+                pc.execute('SELECT "Id"::text FROM "Cliente" WHERE "Id"::text = ANY(%s)',
+                           (ids[i:i + 200],))
+                existentes.update(r[0] for r in pc.fetchall())
+    except Exception as exc:
+        # SIM fora do ar: nao mexe em cadastro nenhum.
+        log(f"[pull] aviso: nao consegui conferir os clientes no SIM "
+            f"({type(exc).__name__}); nada foi alterado.")
+        return 0
+
+    apagados = 0
+    mantidos = 0
+    with my.cursor() as cur:
+        for cid, nome, sim_id in vinculados:
+            if str(sim_id) in existentes:
+                continue
+            cur.execute("SELECT COUNT(*) FROM compras WHERE cliente_id=%s", (cid,))
+            tem_compra = int(cur.fetchone()[0]) > 0
+            if tem_compra:
+                cur.execute(
+                    "UPDATE clientes SET sim_pessoa_id=NULL, sim_cliente_id=NULL, "
+                    "sync_status='ignorado', "
+                    "sync_erro='Pessoa apagada no PDV (SIM). Cadastro mantido porque tem compras.' "
+                    "WHERE id=%s", (cid,))
+                mantidos += 1
+            else:
+                cur.execute("DELETE FROM clientes WHERE id=%s", (cid,))
+                apagados += 1
+
+    if apagados or mantidos:
+        log(f"[pull] {apagados} cliente(s) apagado(s) no SIM sairam do clube"
+            + (f"; {mantidos} mantido(s) por ter compras." if mantidos else "."))
+    return apagados + mantidos
+
+
 def pull_compras(env, dry_run, dias):
     read_url = sim_read_url(env)
     my = mysql_conn(club_url(env))
@@ -446,6 +503,10 @@ def pull_compras(env, dry_run, dias):
     inserted = 0
 
     try:
+        # Cliente apagado no PDV sai do clube (ou vira 'ignorado' se tiver compras).
+        if not dry_run:
+            reconciliar_clientes(my, pg)
+
         with my.cursor() as cur:
             cur.execute("SELECT cpf, id FROM clientes "
                        "WHERE excluido_em IS NULL AND sim_cliente_id IS NOT NULL")
