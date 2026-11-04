@@ -499,6 +499,8 @@ class OfertaEntrada(BaseModel):
     ativo: bool = True
     imagem_base64: str | None = None
     remover_foto: bool = False
+    sim_produto_id: str | None = None
+    sim_produto_nome: str | None = None
 
 
 class OfertaAcao(BaseModel):
@@ -555,8 +557,8 @@ def listar_ofertas():
             cur.execute(
                 "SELECT id,produto,descricao,categoria,preco_de,preco_por,unidade,"
                 "desconto,imagem_url,(imagem_bytes IS NOT NULL) AS tem_foto,"
-                "destaque,ativo,ordem,atualizado_em FROM ofertas "
-                "ORDER BY ativo DESC, ordem, criado_em")
+                "destaque,ativo,ordem,atualizado_em,sim_produto_id,sim_produto_nome "
+                "FROM ofertas ORDER BY ativo DESC, ordem, criado_em")
             linhas = cur.fetchall()
     finally:
         db.close()
@@ -595,6 +597,46 @@ def foto_oferta(oferta_id: str):
                     headers={"Cache-Control": "no-store"})
 
 
+SQL_PRODUTOS_SIM = """
+SELECT p."Id"::text AS id, p."NomeProduto" AS nome,
+       COALESCE(ptp."PrecoVenda", 0) AS preco
+FROM "Produto" p
+LEFT JOIN "ProdutoTabelaPreco" ptp
+  ON ptp."ProdutoId" = p."Id"
+ AND ptp."TabelaPrecoId" = (
+     SELECT "Id" FROM "TabelaPreco"
+      WHERE "NomeTabela" <> 'CLUBE DIANA'
+      ORDER BY "FrenteCaixa" DESC, "NomeTabela" LIMIT 1)
+WHERE p."Eliminado" = false
+  AND upper(p."NomeProduto") LIKE %s
+ORDER BY p."NomeProduto"
+LIMIT 25
+"""
+
+
+@app.get("/api/sim/produtos")
+def sim_produtos(busca: str = ""):
+    """Busca produto no PDV para ligar a oferta ao item que o caixa vende."""
+    termo = (busca or "").strip()
+    if len(termo) < 2:
+        return {"ok": True, "produtos": []}
+    try:
+        conn = sim_conn()
+    except HTTPException as erro:
+        return {"ok": False, "erro": erro.detail, "produtos": []}
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(SQL_PRODUTOS_SIM, ("%" + termo.upper() + "%",))
+            linhas = cur.fetchall()
+    except Exception as exc:
+        return {"ok": False, "erro": type(exc).__name__, "produtos": []}
+    finally:
+        conn.close()
+    return {"ok": True, "produtos": [
+        {"id": str(r["id"]), "nome": r["nome"], "preco": float(r["preco"] or 0)}
+        for r in linhas]}
+
+
 @app.post("/api/ofertas/salvar")
 def salvar_oferta(body: OfertaEntrada):
     produto = _limpo(body.produto, 120)
@@ -621,6 +663,10 @@ def salvar_oferta(body: OfertaEntrada):
     descricao = _limpo(body.descricao, 400)
     categoria = _limpo(body.categoria, 60)
     foto, mime = _decodificar_foto(body.imagem_base64)
+    sim_produto_id = _limpo(body.sim_produto_id, 36) or None
+    sim_produto_nome = _limpo(body.sim_produto_nome, 160) or None
+    if sim_produto_id and not sim_produto_nome:
+        raise HTTPException(400, "Escolha o produto do SIM na lista")
 
     db = conn()
     try:
@@ -631,10 +677,11 @@ def salvar_oferta(body: OfertaEntrada):
                     raise HTTPException(404, "Oferta nao encontrada")
                 campos = ["produto=%s", "descricao=%s", "categoria=%s", "preco_de=%s",
                           "preco_por=%s", "unidade=%s", "desconto=%s", "destaque=%s",
-                          "ativo=%s"]
+                          "ativo=%s", "sim_produto_id=%s", "sim_produto_nome=%s"]
                 valores = [produto, descricao or None, categoria or None, preco_de,
                            body.preco_por, unidade, desconto,
-                           1 if body.destaque else 0, 1 if body.ativo else 0]
+                           1 if body.destaque else 0, 1 if body.ativo else 0,
+                           sim_produto_id, sim_produto_nome]
                 if foto:
                     campos += ["imagem_bytes=%s", "imagem_mime=%s", "imagem_url=NULL"]
                     valores += [foto, mime]
@@ -649,11 +696,13 @@ def salvar_oferta(body: OfertaEntrada):
                 ordem = int((cur.fetchone() or {}).get("proxima") or 1)
                 cur.execute(
                     "INSERT INTO ofertas (id,produto,descricao,categoria,preco_de,preco_por,"
-                    "unidade,desconto,imagem_bytes,imagem_mime,destaque,ativo,ordem) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "unidade,desconto,imagem_bytes,imagem_mime,destaque,ativo,ordem,"
+                    "sim_produto_id,sim_produto_nome) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (oid, produto, descricao or None, categoria or None, preco_de,
                      body.preco_por, unidade, desconto, foto, mime if foto else None,
-                     1 if body.destaque else 0, 1 if body.ativo else 0, ordem))
+                     1 if body.destaque else 0, 1 if body.ativo else 0, ordem,
+                     sim_produto_id, sim_produto_nome))
                 mensagem = "Oferta publicada. O site mostra em ate 1 minuto."
     finally:
         db.close()
@@ -816,6 +865,10 @@ HTML = """<!doctype html>
   dialog#dlg-oferta{max-width:520px}
   dialog#dlg-oferta h3{margin:0 0 4px}
   dialog#dlg-oferta .dica{margin:0 0 12px}
+  .of-sim-lista{max-height:150px;overflow:auto;border:1px solid var(--linha);border-radius:8px;margin-top:6px;background:#fff}
+  .of-sim-lista button{display:block;width:100%;text-align:left;border:none;border-bottom:1px solid var(--linha);border-radius:0;padding:7px 10px;font-size:12px;background:#fff}
+  .of-sim-lista button:hover{background:#fff7e8}
+  .of-sim-lista small{color:#8a7b69;margin-left:6px}
 </style>
 </head>
 <body>
@@ -907,6 +960,15 @@ HTML = """<!doctype html>
     <div>
       <label for="of-produto">Produto *</label>
       <input type="text" id="of-produto" maxlength="120" placeholder="Ex.: Picanha bovina" required>
+    </div>
+    <div>
+      <label for="of-sim-busca">Produto no SIM (desconto automático no caixa)</label>
+      <div style="display:flex;gap:6px">
+        <input type="text" id="of-sim-busca" placeholder="Ex.: PICANHA" autocomplete="off">
+        <button type="button" class="mini" id="of-sim-buscar">Buscar</button>
+      </div>
+      <div id="of-sim-resultados" class="of-sim-lista" hidden></div>
+      <div id="of-sim-escolhido" class="of-meta" style="margin-top:6px"></div>
     </div>
     <div class="of-linha">
       <div>
@@ -1186,6 +1248,7 @@ var ofertaEditando = null;
 var fotoNova = null;
 var fotoRemovida = false;
 var ofertasCarregadas = [];
+var simEscolhido = null;
 
 function reais(v) {
   return "R$ " + (v || 0).toFixed(2).replace(".", ",");
@@ -1213,6 +1276,9 @@ function carregarOfertas() {
           "<div class='of-topo'><div class='of-nome'>" + esc(o.produto) + "</div>" + situacao + "</div>" +
           "<div class='of-meta'>" + esc(o.categoria || "sem categoria") + " - " + esc(o.unidade) + "</div>" +
           "<div class='of-preco'>" + antes + "<b>" + reais(o.preco_por) + "</b>/" + esc(o.unidade) + selo + "</div>" +
+          "<div class='of-meta'>" + (o.sim_produto_id
+            ? "PDV: " + esc(o.sim_produto_nome || "")
+            : "<span style='color:#a4162a'>PDV: nao ligado</span>") + "</div>" +
           "<div class='of-acoes'>" +
             "<button class='mini' data-of='editar' data-id='" + esc(o.id) + "'>Editar</button>" +
             "<button class='mini' data-of='ativo' data-id='" + esc(o.id) + "' data-valor='" + (o.ativo ? "0" : "1") + "'>" +
@@ -1233,6 +1299,77 @@ function mostrarPreview(url) {
     ? "<img src='" + esc(url) + "' alt=''>"
     : "<div class='sem'>sem foto</div>";
 }
+
+/* ---------- vinculo com o produto do SIM ---------- */
+
+function mostrarSimEscolhido() {
+  var alvo = $("of-sim-escolhido");
+  if (!alvo) return;
+  if (simEscolhido && simEscolhido.id) {
+    var preco = simEscolhido.preco ? " (R$ " + reais(simEscolhido.preco) + " hoje)" : "";
+    alvo.innerHTML = "Ligado a <strong>" + esc(simEscolhido.nome) + "</strong>" + preco +
+      " <button type='button' class='mini' id='of-sim-limpar' style='margin-left:6px'>Remover</button>";
+    $("of-sim-limpar").addEventListener("click", function () {
+      simEscolhido = null;
+      mostrarSimEscolhido();
+    });
+  } else {
+    alvo.innerHTML = "<span style='color:#a4162a'>Nenhum produto do SIM ligado — o desconto não cai no caixa.</span>";
+  }
+}
+
+function buscarSimProdutos() {
+  var termo = $("of-sim-busca").value.trim();
+  var lista = $("of-sim-resultados");
+  if (termo.length < 2) {
+    lista.hidden = false;
+    lista.innerHTML = "<div style='padding:8px;font-size:12px'>Digite pelo menos 2 letras.</div>";
+    return;
+  }
+  lista.hidden = false;
+  lista.innerHTML = "<div style='padding:8px;font-size:12px'>Buscando no PDV...</div>";
+  fetch("/api/sim/produtos?busca=" + encodeURIComponent(termo))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d.ok) {
+        lista.innerHTML = "<div style='padding:8px;font-size:12px'>PDV indisponível (" +
+          esc(d.erro || "erro") + ").</div>";
+        return;
+      }
+      if (!d.produtos.length) {
+        lista.innerHTML = "<div style='padding:8px;font-size:12px'>Nenhum produto encontrado.</div>";
+        return;
+      }
+      lista.innerHTML = d.produtos.map(function (p) {
+        return "<button type='button' data-sim-id='" + esc(p.id) + "' data-sim-nome='" +
+          esc(p.nome) + "' data-sim-preco='" + p.preco + "'>" + esc(p.nome) +
+          "<small>R$ " + reais(p.preco) + "</small></button>";
+      }).join("");
+    })
+    .catch(function () {
+      lista.innerHTML = "<div style='padding:8px;font-size:12px'>Sem conexão com o PDV.</div>";
+    });
+}
+
+$("of-sim-buscar").addEventListener("click", buscarSimProdutos);
+$("of-sim-busca").addEventListener("keydown", function (ev) {
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    buscarSimProdutos();
+  }
+});
+$("of-sim-resultados").addEventListener("click", function (ev) {
+  var b = ev.target.closest("button[data-sim-id]");
+  if (!b) return;
+  simEscolhido = {
+    id: b.dataset.simId,
+    nome: b.dataset.simNome,
+    preco: parseFloat(b.dataset.simPreco) || 0
+  };
+  $("of-sim-resultados").hidden = true;
+  $("of-sim-busca").value = "";
+  mostrarSimEscolhido();
+});
 
 function abrirOferta(id) {
   var o = null;
@@ -1262,6 +1399,12 @@ function abrirOferta(id) {
   $("of-ativo").checked = o ? !!o.ativo : true;
   $("of-foto").value = "";
   $("of-erro").textContent = "";
+  simEscolhido = o && o.sim_produto_id
+    ? { id: o.sim_produto_id, nome: o.sim_produto_nome || "", preco: 0 }
+    : null;
+  $("of-sim-busca").value = "";
+  $("of-sim-resultados").hidden = true;
+  mostrarSimEscolhido();
   mostrarPreview(o && o.foto ? o.foto : "");
   $("dlg-oferta").showModal();
   $("of-produto").focus();
@@ -1384,7 +1527,9 @@ $("of-salvar").addEventListener("click", function () {
     destaque: $("of-destaque").checked,
     ativo: $("of-ativo").checked,
     imagem_base64: fotoNova || null,
-    remover_foto: fotoRemovida
+    remover_foto: fotoRemovida,
+    sim_produto_id: simEscolhido ? simEscolhido.id : null,
+    sim_produto_nome: simEscolhido ? simEscolhido.nome : null
   };
 
   var botao = $("of-salvar");

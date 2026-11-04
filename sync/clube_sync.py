@@ -704,6 +704,15 @@ def main():
             tecnico = True
             log(f"[erro] {type(exc).__name__}: {str(exc)[:200]}")
 
+        # Precos do clube no SIM (tabela CLUBE DIANA). Falha aqui nao derruba
+        # o sync: o cadastro e as compras continuam funcionando.
+        if args.all and not args.dry_run:
+            try:
+                import precos_clube
+                precos_clube.sincronizar()
+            except Exception as exc:
+                log(f"[precos] aviso: {type(exc).__name__}: {str(exc)[:160]}")
+
         if not args.dry_run:
             alertar_se_preciso(registrar_falhas(env, sucesso=not tecnico),
                                "Confira se o SIM e o banco estao acessiveis.")
