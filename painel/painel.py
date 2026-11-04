@@ -918,7 +918,7 @@ HTML_CADASTRO = r"""<!doctype html>
       <input type="text" id="tel" inputmode="numeric" placeholder="(00) 00000-0000">
     </label>
     <label class="aceite">
-      <input type="checkbox" id="aceite">
+      <input type="checkbox" id="aceite" checked>
       <span>O cliente autoriza o cadastro e o uso dos dados no Clube Diana (LGPD).</span>
     </label>
     <button type="submit" id="bt">Cadastrar</button>
@@ -993,7 +993,7 @@ HTML_CADASTRO = r"""<!doctype html>
         return;
       }
       mostrar(j.no_sim === false ? "aviso" : "ok", j.mensagem || "Cadastrado.");
-      nome.value = ""; cpf.value = ""; nasc.value = ""; tel.value = ""; aceite.checked = false;
+      nome.value = ""; cpf.value = ""; nasc.value = ""; tel.value = ""; aceite.checked = true;
       nome.focus();
     }).catch(function () {
       mostrar("erro", "Sem conexao com o painel. Tente de novo.");
