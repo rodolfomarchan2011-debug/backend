@@ -15,12 +15,14 @@ Permite:
   - corrigir o CPF de um cadastro com erro
 """
 import base64
+import hashlib
 import os
 import re
 import secrets
 import subprocess
 import sys
 import threading
+import uuid
 from datetime import datetime
 from urllib.parse import urlparse, unquote
 
@@ -33,6 +35,12 @@ import io as _io
 
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
+
+# rodando com pythonw (sem console) stdout/stderr sao None: o uvicorn quebra
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_CANDIDATES = [
@@ -483,6 +491,94 @@ def home():
     return HTML
 
 
+# ---------------- cadastro rapido no caixa ----------------
+# O caixa cadastra em segundos: nome, CPF, nascimento e telefone. Sem senha
+# (a pessoa define depois em "esqueci minha senha" no site) e ja empurra para
+# o SIM na hora, sem esperar a tarefa de 1 minuto.
+
+def _hash_senha(senha: str) -> str:
+    salt = secrets.token_bytes(16)
+    n, r, p = 2 ** 14, 8, 1
+    dk = hashlib.scrypt(senha.encode(), salt=salt, n=n, r=r, p=p, dklen=32)
+    return f"scrypt${n}${r}${p}${salt.hex()}${dk.hex()}"
+
+
+class CadastroRapido(BaseModel):
+    nome: str = ""
+    cpf: str = ""
+    nascimento: str | None = None
+    telefone: str | None = None
+    aceite: bool = False
+
+
+@app.get("/cadastro", response_class=HTMLResponse)
+def cadastro_pagina():
+    return HTML_CADASTRO
+
+
+@app.post("/api/cadastro-rapido")
+def cadastro_rapido(body: CadastroRapido):
+    nome = " ".join((body.nome or "").split())[:160]
+    cpf = re.sub(r"\D", "", body.cpf or "")
+    tel = re.sub(r"\D", "", body.telefone or "")
+    if len(nome) < 3:
+        raise HTTPException(400, "Informe o nome completo.")
+    if not cpf_valido(cpf):
+        raise HTTPException(400, "CPF invalido. Confira os numeros.")
+    if len(tel) not in (10, 11):
+        raise HTTPException(400, "Telefone invalido. Use DDD + numero.")
+    if not body.aceite:
+        raise HTTPException(400, "O cliente precisa autorizar o cadastro.")
+    nasc = None
+    if (body.nascimento or "").strip():
+        try:
+            nasc = datetime.strptime(body.nascimento.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(400, "Data de nascimento invalida.")
+        if nasc.year < 1900 or nasc > datetime.now().date():
+            raise HTTPException(400, "Data de nascimento invalida.")
+
+    db = conn()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT nome FROM clientes WHERE cpf=%s AND excluido_em IS NULL", (cpf,))
+            achou = cur.fetchone()
+            if achou:
+                return {"ok": True, "ja_existe": True, "nome": achou["nome"],
+                        "mensagem": f"{achou['nome']} ja tem cadastro no clube."}
+            cid = str(uuid.uuid4())
+            cur.execute(
+                "INSERT INTO clientes (id,nome,cpf,telefone,data_nascimento,senha_hash,"
+                "aceite_lgpd,aceite_em,aceite_versao,sync_status) "
+                "VALUES (%s,%s,%s,%s,%s,%s,1,NOW(),%s,'pendente')",
+                (cid, nome, cpf, tel, nasc,
+                 _hash_senha(secrets.token_urlsafe(24)), "caixa"))
+    finally:
+        db.close()
+
+    try:
+        subprocess.run([sys.executable, os.path.join(ROOT, "sync", "clube_sync.py"),
+                        "--push-cadastros", "--cpf", cpf],
+                       cwd=ROOT, capture_output=True, timeout=90)
+    except Exception:
+        pass
+
+    db = conn()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT sync_status, sync_erro FROM clientes WHERE id=%s", (cid,))
+            estado = cur.fetchone() or {}
+    finally:
+        db.close()
+
+    if estado.get("sync_status") == "sincronizado":
+        return {"ok": True, "no_sim": True, "nome": nome,
+                "mensagem": f"{nome} cadastrado(a) e ja pode usar no caixa."}
+    return {"ok": True, "no_sim": False, "nome": nome,
+            "mensagem": f"{nome} cadastrado(a). Entra no caixa em ate 1 minuto.",
+            "aviso": estado.get("sync_erro")}
+
+
 # ---------------- ofertas do site ----------------
 # A loja edita aqui o que aparece em "Ofertas da semana" no site.
 # Grava direto no banco do clube; a API publica (GET /api/ofertas) e o site
@@ -768,6 +864,151 @@ def excluir_oferta(body: Id):
     return {"ok": True, "mensagem": "Oferta apagada."}
 
 
+HTML_CADASTRO = r"""<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cadastro rapido - Clube Diana</title>
+<style>
+  :root{--marrom:#2b1d16;--vermelho:#a4161a;--dourado:#d4a017;--creme:#faf6ef;--linha:#e8ddcd;}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--creme);color:#241a14}
+  header{background:var(--marrom);color:#fff;padding:14px 22px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+  header h1{margin:0;font-size:18px}
+  header a{color:#f3d9a4;font-size:13px;text-decoration:none}
+  main{max-width:640px;margin:0 auto;padding:22px 16px 60px}
+  .sub{font-size:13px;color:#7a6b59;margin:0 0 18px}
+  label{display:block;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#8a7b69;margin-bottom:12px}
+  input[type=text]{display:block;width:100%;margin-top:5px;padding:13px 14px;font-size:19px;border:1px solid var(--linha);border-radius:10px;background:#fff;font-weight:600}
+  input[type=text]:focus{outline:2px solid var(--dourado);border-color:var(--dourado)}
+  .linha{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .aceite{display:flex;gap:9px;align-items:flex-start;text-transform:none;letter-spacing:0;font-size:13px;font-weight:500;color:#4a3f34;margin:6px 0 16px}
+  .aceite input{width:20px;height:20px;margin:1px 0 0}
+  button{width:100%;font:inherit;font-size:19px;font-weight:700;padding:16px;border:0;border-radius:12px;background:var(--vermelho);color:#fff;cursor:pointer}
+  button:hover{background:#8d1214}
+  button:disabled{opacity:.55;cursor:wait}
+  #msg{margin-top:18px;font-size:17px;font-weight:600;line-height:1.35}
+  .ok{background:#e8f5e9;border:1px solid #a5d6a7;color:#1b5e20;padding:16px;border-radius:12px}
+  .aviso{background:#fff8e1;border:1px solid #ffe082;color:#7a5c00;padding:16px;border-radius:12px}
+  .erro{background:#fdecea;border:1px solid #f5c2c0;color:#8d1214;padding:16px;border-radius:12px}
+  .dica{font-size:12px;color:#8a7b69;margin-top:10px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Cadastro rapido &middot; Clube Diana</h1>
+  <a href="/">Voltar ao painel</a>
+</header>
+<main>
+  <p class="sub">Nome, CPF, nascimento e telefone. Sem senha: a pessoa define depois no site.</p>
+  <form id="f" autocomplete="off">
+    <label>Nome completo
+      <input type="text" id="nome" autofocus placeholder="Ex.: Maria da Silva">
+    </label>
+    <div class="linha">
+      <label>CPF
+        <input type="text" id="cpf" inputmode="numeric" placeholder="000.000.000-00">
+      </label>
+      <label>Nascimento
+        <input type="text" id="nasc" inputmode="numeric" placeholder="dd/mm/aaaa">
+      </label>
+    </div>
+    <label>Telefone (WhatsApp)
+      <input type="text" id="tel" inputmode="numeric" placeholder="(00) 00000-0000">
+    </label>
+    <label class="aceite">
+      <input type="checkbox" id="aceite">
+      <span>O cliente autoriza o cadastro e o uso dos dados no Clube Diana (LGPD).</span>
+    </label>
+    <button type="submit" id="bt">Cadastrar</button>
+  </form>
+  <div id="msg"></div>
+  <p class="dica">Enter no ultimo campo ja cadastra. Depois de salvar, o campo volta no nome para o proximo cliente.</p>
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var nome = $("nome"), cpf = $("cpf"), nasc = $("nasc"), tel = $("tel"), aceite = $("aceite"), bt = $("bt"), msg = $("msg");
+
+  function soDigitos(v) { return (v || "").replace(/[^0-9]/g, ""); }
+
+  cpf.addEventListener("input", function () {
+    var d = soDigitos(cpf.value).slice(0, 11), t = d;
+    if (d.length > 9) t = d.slice(0, 3) + "." + d.slice(3, 6) + "." + d.slice(6, 9) + "-" + d.slice(9);
+    else if (d.length > 6) t = d.slice(0, 3) + "." + d.slice(3, 6) + "." + d.slice(6);
+    else if (d.length > 3) t = d.slice(0, 3) + "." + d.slice(3);
+    cpf.value = t;
+  });
+
+  tel.addEventListener("input", function () {
+    var d = soDigitos(tel.value).slice(0, 11), t = d;
+    if (d.length > 6) t = "(" + d.slice(0, 2) + ") " + d.slice(2, d.length > 10 ? 7 : 6) + "-" + d.slice(d.length > 10 ? 7 : 6);
+    else if (d.length > 2) t = "(" + d.slice(0, 2) + ") " + d.slice(2);
+    else if (d.length > 0) t = "(" + d;
+    tel.value = t;
+  });
+
+  nasc.addEventListener("input", function () {
+    var d = soDigitos(nasc.value).slice(0, 8), t = d;
+    if (d.length > 4) t = d.slice(0, 2) + "/" + d.slice(2, 4) + "/" + d.slice(4);
+    else if (d.length > 2) t = d.slice(0, 2) + "/" + d.slice(2);
+    nasc.value = t;
+  });
+
+  function mostrar(tipo, texto) {
+    msg.className = tipo;
+    msg.textContent = texto;
+  }
+
+  function dataISO(v) {
+    var d = soDigitos(v);
+    if (d.length !== 8) return "";
+    return d.slice(4, 8) + "-" + d.slice(2, 4) + "-" + d.slice(0, 2);
+  }
+
+  $("f").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    msg.className = "";
+    msg.textContent = "";
+    var dados = {
+      nome: nome.value,
+      cpf: cpf.value,
+      nascimento: dataISO(nasc.value),
+      telefone: tel.value,
+      aceite: aceite.checked
+    };
+    bt.disabled = true;
+    bt.textContent = "Enviando...";
+    fetch("/api/cadastro-rapido", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dados)
+    }).then(function (r) {
+      return r.json().then(function (j) { return { status: r.status, corpo: j }; });
+    }).then(function (res) {
+      var j = res.corpo || {};
+      if (res.status !== 200) {
+        mostrar("erro", j.detail || "Nao foi possivel cadastrar.");
+        return;
+      }
+      mostrar(j.no_sim === false ? "aviso" : "ok", j.mensagem || "Cadastrado.");
+      nome.value = ""; cpf.value = ""; nasc.value = ""; tel.value = ""; aceite.checked = false;
+      nome.focus();
+    }).catch(function () {
+      mostrar("erro", "Sem conexao com o painel. Tente de novo.");
+    }).then(function () {
+      bt.disabled = false;
+      bt.textContent = "Cadastrar";
+    });
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
+
 HTML = """<!doctype html>
 <html lang="pt-BR">
 <head>
@@ -879,7 +1120,11 @@ HTML = """<!doctype html>
     <h1>Clube Diana - Painel da loja</h1>
     <div class="sub" id="atualizado">carregando...</div>
   </div>
-  <div style="font-size:12px;opacity:.8">roda so neste computador</div>
+  <div style="font-size:12px;opacity:.8">
+    <a href="/cadastro" style="color:#f3d9a4;font-weight:700;text-decoration:none;
+       background:rgba(255,255,255,.12);padding:8px 12px;border-radius:9px">Cadastro rapido no caixa</a>
+    &nbsp; roda so neste computador
+  </div>
 </header>
 <main>
   <div id="alerta" class="alerta oculto"></div>
