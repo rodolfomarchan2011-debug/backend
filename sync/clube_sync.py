@@ -584,6 +584,19 @@ def pull_compras(env, dry_run, dias):
                                (linha_normal["Id"],))
                     preco_normal = {l["pid"]: float(l["preco"] or 0) for l in pc.fetchall()}
 
+                # modo da etiqueta de balanca: 0 = total, 1 = peso.
+                # Com a etiqueta em TOTAL o SIM deriva o peso do preco, entao o
+                # item de balanca NAO teve desconto de verdade: nao somar
+                # economia dele (senao o painel do cliente mente).
+                pc.execute('SELECT "EtiquetaBalancaTotal" FROM "Empresa"')
+                linha_modo = pc.fetchone() or {}
+                modo_total = (linha_modo.get("EtiquetaBalancaTotal") or 0) == 0
+                balanca_ids = set()
+                if modo_total:
+                    pc.execute('SELECT "Id"::text AS pid FROM "Produto" '
+                               'WHERE "BalancaIntegracao" <> 0')
+                    balanca_ids = {l["pid"] for l in pc.fetchall()}
+
         # Compra cancelada no caixa some do SIM; aqui ela tambem sai do clube.
         removidas = 0
         if not dry_run:
@@ -613,6 +626,10 @@ def pull_compras(env, dry_run, dias):
                     if normal is None:
                         continue
                     it["preco_normal"] = round(normal, 2)
+                    if modo_total and it["produto_id"] in balanca_ids:
+                        # etiqueta em total: o peso e derivado do preco, nao houve
+                        # desconto real neste item
+                        continue
                     diferenca = normal - it["preco"]
                     if diferenca > 0:
                         economia += diferenca * it["quantidade"]
