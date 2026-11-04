@@ -53,6 +53,7 @@ BACKUP_DIR = os.path.join(ROOT, "backups")
 LOG_DIR = os.path.join(ROOT, "logs")
 LOG_PATH = os.path.join(LOG_DIR, "sync.log")
 LOCK_PATH = os.path.join(LOG_DIR, ".sync.lock")
+PUSH_LOCK_PATH = os.path.join(LOG_DIR, ".push.lock")
 ALERTA_PATH = os.path.join(LOG_DIR, "ALERTA.txt")
 ALERTA_PS1 = os.path.join(ROOT, "sync", "alerta.ps1")
 MAX_TENTATIVAS = 8
@@ -93,23 +94,24 @@ def log(msg):
         pass
 
 
-def pegar_lock():
+def pegar_lock(caminho=None, validade=1800):
     """Impede duas execucoes ao mesmo tempo (agendador + clique manual)."""
+    caminho = caminho or LOCK_PATH
     os.makedirs(LOG_DIR, exist_ok=True)
-    if os.path.isfile(LOCK_PATH):
-        idade = time.time() - os.path.getmtime(LOCK_PATH)
-        if idade < 1800:
+    if os.path.isfile(caminho):
+        idade = time.time() - os.path.getmtime(caminho)
+        if idade < validade:
             log(f"[lock] outra execucao em andamento ({int(idade // 60)} min). Saindo.")
             return False
         log("[lock] lock antigo encontrado, seguindo.")
-    with open(LOCK_PATH, "w", encoding="utf-8") as fh:
+    with open(caminho, "w", encoding="utf-8") as fh:
         fh.write(str(os.getpid()))
     return True
 
 
-def soltar_lock():
+def soltar_lock(caminho=None):
     try:
-        os.remove(LOCK_PATH)
+        os.remove(caminho or LOCK_PATH)
     except OSError:
         pass
 
@@ -272,6 +274,11 @@ def push_cadastros(env, dry_run, cpf_filtro=None, forcar=False):
         log("[push] DIANA_SIM_ESCRITA_URL ausente: escrita no SIM desativada.")
         return 1
 
+    # lock curto: o push roda de minuto em minuto e nao pode ficar esperando
+    # uma sincronizacao completa (--all) terminar.
+    if not pegar_lock(PUSH_LOCK_PATH, 120):
+        return 0
+
     my = mysql_conn(club_url(env))
     pg = pg_conn(write_url, readonly=False)
     pending, write_plan, done, errors = [], [], 0, 0
@@ -372,6 +379,7 @@ def push_cadastros(env, dry_run, cpf_filtro=None, forcar=False):
     finally:
         pg.close()
         my.close()
+        soltar_lock(PUSH_LOCK_PATH)
 
 
 def _mark_ok(my, cid, pessoa_id, cliente_id):
@@ -716,8 +724,14 @@ def main():
         ap.print_help()
         return 0
 
-    if not pegar_lock():
-        return 0
+    # push sozinho tem lock proprio (curto); --all e --pull usam o global
+    somente_push = args.push_cadastros and not args.all and not args.pull_compras
+    if somente_push:
+        pegou_global = False
+    else:
+        if not pegar_lock(LOCK_PATH):
+            return 0
+        pegou_global = True
     try:
         if not args.dry_run:
             backup_automatico(env)
@@ -747,7 +761,8 @@ def main():
                                "Confira se o SIM e o banco estao acessiveis.")
         return 1 if tecnico else 0  # erro de cadastro nao e falha tecnica
     finally:
-        soltar_lock()
+        if pegou_global:
+            soltar_lock()
 
 
 if __name__ == "__main__":
