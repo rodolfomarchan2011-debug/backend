@@ -521,6 +521,12 @@ def pull_compras(env, dry_run, dias):
             cpf_map = {only_digits(cpf): cid for cpf, cid in cur.fetchall() if only_digits(cpf)}
             cur.execute("SELECT valor FROM sync_control WHERE chave='compras_watermark'")
             wm = cur.fetchone()
+            # ofertas ativas: produto do SIM -> preco normal de referencia.
+            # A economia do clube e a diferenca entre esse preco e o que foi
+            # pago (no dia da oferta o preco do produto e baixado para todos).
+            cur.execute("SELECT sim_produto_id, preco_de FROM ofertas "
+                        "WHERE ativo=1 AND sim_produto_id IS NOT NULL")
+            ofertas_ref = {str(pid): float(pd or 0) for pid, pd in cur.fetchall()}
         if not cpf_map:
             log("[pull] nenhum cliente com CPF no clube.")
             return 0
@@ -557,7 +563,6 @@ def pull_compras(env, dry_run, dias):
 
             venda_ids = [r["venda_id"] for r in rows]
             items = {}
-            preco_normal = {}
             if venda_ids:
                 pc.execute(
                     'SELECT "VendaId","ProdutoId","Quantidade","Preco",'
@@ -571,31 +576,6 @@ def pull_compras(env, dry_run, dias):
                         "desconto": float(it["TotalDesconto"] or 0),
                         "total": float(it["TotalLiquido"] or 0),
                     })
-
-                # preco da tabela normal: referencia para calcular a economia do
-                # clube (o SIM grava preco menor, nao desconto).
-                pc.execute('SELECT "Id" FROM "TabelaPreco" WHERE "NomeTabela" <> %s '
-                           'ORDER BY "FrenteCaixa" DESC, "NomeTabela" LIMIT 1',
-                           ("CLUBE DIANA",))
-                linha_normal = pc.fetchone()
-                if linha_normal:
-                    pc.execute('SELECT "ProdutoId"::text AS pid, "PrecoVenda" AS preco '
-                               'FROM "ProdutoTabelaPreco" WHERE "TabelaPrecoId" = %s',
-                               (linha_normal["Id"],))
-                    preco_normal = {l["pid"]: float(l["preco"] or 0) for l in pc.fetchall()}
-
-                # modo da etiqueta de balanca: 0 = total, 1 = peso.
-                # Com a etiqueta em TOTAL o SIM deriva o peso do preco, entao o
-                # item de balanca NAO teve desconto de verdade: nao somar
-                # economia dele (senao o painel do cliente mente).
-                pc.execute('SELECT "EtiquetaBalancaTotal" FROM "Empresa"')
-                linha_modo = pc.fetchone() or {}
-                modo_total = (linha_modo.get("EtiquetaBalancaTotal") or 0) == 0
-                balanca_ids = set()
-                if modo_total:
-                    pc.execute('SELECT "Id"::text AS pid FROM "Produto" '
-                               'WHERE "BalancaIntegracao" <> 0')
-                    balanca_ids = {l["pid"] for l in pc.fetchall()}
 
         # Compra cancelada no caixa some do SIM; aqui ela tambem sai do clube.
         removidas = 0
@@ -618,19 +598,16 @@ def pull_compras(env, dry_run, dias):
                 data_v = r["data_venda"]
                 max_dt = max(max_dt, data_v)
 
-                # economia do clube: preco normal menos o que ele pagou, item a item
+                # economia do clube: preco normal da oferta menos o que ele pagou.
+                # So conta item ligado a uma oferta ativa do site.
                 itens = items.get(vid, [])
                 economia = 0.0
                 for it in itens:
-                    normal = preco_normal.get(it["produto_id"])
-                    if normal is None:
+                    referencia = ofertas_ref.get(it["produto_id"])
+                    if not referencia or referencia <= 0:
                         continue
-                    it["preco_normal"] = round(normal, 2)
-                    if modo_total and it["produto_id"] in balanca_ids:
-                        # etiqueta em total: o peso e derivado do preco, nao houve
-                        # desconto real neste item
-                        continue
-                    diferenca = normal - it["preco"]
+                    it["preco_normal"] = round(referencia, 2)
+                    diferenca = referencia - it["preco"]
                     if diferenca > 0:
                         economia += diferenca * it["quantidade"]
                 economia = round(economia, 2)
@@ -764,14 +741,10 @@ def main():
             tecnico = True
             log(f"[erro] {type(exc).__name__}: {str(exc)[:200]}")
 
-        # Precos do clube no SIM (tabela CLUBE DIANA). Falha aqui nao derruba
-        # o sync: o cadastro e as compras continuam funcionando.
-        if args.all and not args.dry_run:
-            try:
-                import precos_clube
-                precos_clube.sincronizar()
-            except Exception as exc:
-                log(f"[precos] aviso: {type(exc).__name__}: {str(exc)[:160]}")
+        # Tabela de preco do clube DESATIVADA em 04/11/2026: a loja passou a
+        # trabalhar com o preco normal e, no dia da oferta, baixa o preco do
+        # produto para todos. O modulo sync/precos_clube.py fica guardado, mas
+        # nao roda mais (recriaria a tabela CLUBE DIANA).
 
         if not args.dry_run:
             alertar_se_preciso(registrar_falhas(env, sucesso=not tecnico),

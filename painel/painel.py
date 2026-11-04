@@ -1239,8 +1239,8 @@ HTML = """<!doctype html>
     </div>
     <div class="of-linha3">
       <div>
-        <label for="of-preco-de">Preco normal (R$)</label>
-        <input type="number" id="of-preco-de" min="0" step="0.01" placeholder="89,90">
+        <label for="of-preco-de">Preco normal (R$) - e a referencia da economia</label>
+        <input type="number" id="of-preco-de" min="0" step="0.01" placeholder="77,90">
       </div>
       <div>
         <label for="of-preco-por">Preco do clube (R$) *</label>
