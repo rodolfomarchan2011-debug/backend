@@ -577,7 +577,7 @@ def compras(user=Depends(atual), limit: int = 20, offset: int = 0,
             cur.execute("SELECT COUNT(*) AS n FROM compras WHERE " + where, tuple(params))
             total = int(cur.fetchone()["n"])
             cur.execute(
-                "SELECT data_venda, total_liquido, total_desconto, cupom "
+                "SELECT data_venda, total_liquido, total_desconto, economia_clube, cupom "
                 "FROM compras WHERE " + where +
                 " ORDER BY data_venda DESC LIMIT %s OFFSET %s",
                 tuple(params) + (limit, offset))
@@ -589,6 +589,8 @@ def compras(user=Depends(atual), limit: int = 20, offset: int = 0,
         r["data_venda"] = r["data_venda"].strftime("%d/%m/%Y %H:%M")
         r["total_liquido"] = float(r["total_liquido"] or 0)
         r["total_desconto"] = float(r["total_desconto"] or 0)
+        r["economia_clube"] = float(r["economia_clube"] or 0)
+        r["economia"] = round(r["total_desconto"] + r["economia_clube"], 2)
 
     return {"ok": True, "total": total, "offset": offset,
             "tem_mais": offset + len(rows) < total,
@@ -608,12 +610,13 @@ def resumo(user=Depends(atual), de: str | None = None, ate: str | None = None):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) AS qtd, COALESCE(SUM(total_liquido),0) AS gasto, "
-                "COALESCE(SUM(total_desconto),0) AS economia, MAX(data_venda) AS ultima "
+                "COALESCE(SUM(total_desconto),0) + COALESCE(SUM(economia_clube),0) AS economia, "
+                "MAX(data_venda) AS ultima "
                 "FROM compras WHERE " + where, tuple(params))
             r = cur.fetchone()
             cur.execute(
                 "SELECT COUNT(*) AS qtd, COALESCE(SUM(total_liquido),0) AS gasto, "
-                "COALESCE(SUM(total_desconto),0) AS economia, "
+                "COALESCE(SUM(total_desconto),0) + COALESCE(SUM(economia_clube),0) AS economia, "
                 "MIN(data_venda) AS primeira, MAX(data_venda) AS ultima "
                 "FROM compras WHERE cliente_id=%s", (user["id"],))
             g = cur.fetchone()

@@ -549,6 +549,7 @@ def pull_compras(env, dry_run, dias):
 
             venda_ids = [r["venda_id"] for r in rows]
             items = {}
+            preco_normal = {}
             if venda_ids:
                 pc.execute(
                     'SELECT "VendaId","ProdutoId","Quantidade","Preco",'
@@ -562,6 +563,18 @@ def pull_compras(env, dry_run, dias):
                         "desconto": float(it["TotalDesconto"] or 0),
                         "total": float(it["TotalLiquido"] or 0),
                     })
+
+                # preco da tabela normal: referencia para calcular a economia do
+                # clube (o SIM grava preco menor, nao desconto).
+                pc.execute('SELECT "Id" FROM "TabelaPreco" WHERE "NomeTabela" <> %s '
+                           'ORDER BY "FrenteCaixa" DESC, "NomeTabela" LIMIT 1',
+                           ("CLUBE DIANA",))
+                linha_normal = pc.fetchone()
+                if linha_normal:
+                    pc.execute('SELECT "ProdutoId"::text AS pid, "PrecoVenda" AS preco '
+                               'FROM "ProdutoTabelaPreco" WHERE "TabelaPrecoId" = %s',
+                               (linha_normal["Id"],))
+                    preco_normal = {l["pid"]: float(l["preco"] or 0) for l in pc.fetchall()}
 
         # Compra cancelada no caixa some do SIM; aqui ela tambem sai do clube.
         removidas = 0
@@ -583,22 +596,38 @@ def pull_compras(env, dry_run, dias):
                 vid = str(r["venda_id"])
                 data_v = r["data_venda"]
                 max_dt = max(max_dt, data_v)
-                payload = json.dumps(items.get(vid, []), ensure_ascii=False)
+
+                # economia do clube: preco normal menos o que ele pagou, item a item
+                itens = items.get(vid, [])
+                economia = 0.0
+                for it in itens:
+                    normal = preco_normal.get(it["produto_id"])
+                    if normal is None:
+                        continue
+                    it["preco_normal"] = round(normal, 2)
+                    diferenca = normal - it["preco"]
+                    if diferenca > 0:
+                        economia += diferenca * it["quantidade"]
+                economia = round(economia, 2)
+
+                payload = json.dumps(itens, ensure_ascii=False)
                 if dry_run:
                     inserted += 1
                     continue
                 cur.execute(
                     "INSERT INTO compras (id, cliente_id, sim_venda_id, sim_lancamento_id, "
-                    "data_venda, total_produtos, total_desconto, total_liquido, cupom, itens_json) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "data_venda, total_produtos, total_desconto, total_liquido, cupom, "
+                    "itens_json, economia_clube) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                     "ON DUPLICATE KEY UPDATE cliente_id=VALUES(cliente_id), "
                     "data_venda=VALUES(data_venda), total_produtos=VALUES(total_produtos), "
                     "total_desconto=VALUES(total_desconto), total_liquido=VALUES(total_liquido), "
-                    "cupom=VALUES(cupom), itens_json=VALUES(itens_json), synced_at=NOW()",
+                    "cupom=VALUES(cupom), itens_json=VALUES(itens_json), "
+                    "economia_clube=VALUES(economia_clube), synced_at=NOW()",
                     (str(uuid.uuid5(NS, f"clube:venda:{vid}")), cid, vid,
                      str(r["lanc_id"]) if r["lanc_id"] else None, data_v,
                      r["TotalProdutos"] or 0, r["TotalDesconto"] or 0,
-                     r["TotalLiquido"] or 0, r["Cupom"], payload))
+                     r["TotalLiquido"] or 0, r["Cupom"], payload, economia))
                 inserted += 1
 
             if not dry_run:

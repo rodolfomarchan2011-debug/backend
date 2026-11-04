@@ -219,12 +219,14 @@ def relatorio(mes: str | None = None):
             cli = cur.fetchone() or {}
             cur.execute("SELECT COUNT(*) AS compras, COUNT(DISTINCT cliente_id) AS clientes, "
                         "COALESCE(SUM(total_liquido),0) AS valor, "
-                        "COALESCE(SUM(total_desconto),0) AS desconto FROM compras "
+                        "COALESCE(SUM(total_desconto),0) + COALESCE(SUM(economia_clube),0) "
+                        "AS desconto FROM compras "
                         "WHERE data_venda >= %s AND data_venda < %s", (inicio, fim))
             comp = cur.fetchone() or {}
             cur.execute("SELECT c.nome, c.cpf, COUNT(*) AS compras, "
                         "COALESCE(SUM(k.total_liquido),0) AS valor, "
-                        "COALESCE(SUM(k.total_desconto),0) AS desconto "
+                        "COALESCE(SUM(k.total_desconto),0) + COALESCE(SUM(k.economia_clube),0) "
+                        "AS desconto "
                         "FROM compras k JOIN clientes c ON c.id=k.cliente_id "
                         "WHERE k.data_venda >= %s AND k.data_venda < %s "
                         "GROUP BY c.id ORDER BY valor DESC LIMIT 5", (inicio, fim))
