@@ -16,6 +16,7 @@ import argparse
 import os
 import sys
 import uuid
+from datetime import datetime
 
 import psycopg2
 
@@ -30,6 +31,8 @@ NOME_TABELA = "CLUBE TESTE"
 ID_TABELA = uuid.UUID("c1b0e000-0000-4000-8000-000000000001")
 PRODUTO_TESTE = "PICANHA KG"
 PRECO_TESTE = 10.00
+CPF_TESTE = "222.333.444-05"
+NOME_TESTE = "TESTE CLUBE DIANA"
 
 
 def carregar_env():
@@ -141,11 +144,58 @@ def desfazer(conn):
     print(f"OK: {apagadas} tabela(s) apagada(s) e {soltos} cliente(s) desligado(s).")
 
 
+def criar_cliente_teste(conn):
+    """Cria (ou reaproveita) o cliente de teste apontando para a tabela CLUBE TESTE."""
+    with conn.cursor() as cur:
+        cur.execute('SELECT "Id" FROM "Pessoa" WHERE "Documento" = %s', (CPF_TESTE,))
+        achado = cur.fetchone()
+        if achado:
+            pessoa_id = achado[0]
+            cur.execute('SELECT "Id" FROM "Cliente" WHERE "PessoaId" = %s', (pessoa_id,))
+            cli = cur.fetchone()
+            if cli:
+                cur.execute('UPDATE "Cliente" SET "TabelaPrecoId" = %s WHERE "Id" = %s',
+                            (str(ID_TABELA), cli[0]))
+                conn.commit()
+                print(f"Cliente de teste ja existia; tabela de preco atualizada. CPF {CPF_TESTE}")
+                return
+            cliente_id = str(uuid.uuid4())
+        else:
+            pessoa_id = str(uuid.uuid4())
+            cliente_id = str(uuid.uuid4())
+            cur.execute('INSERT INTO "Pessoa" ("Id","Nome","Apelido","Regime",'
+                        '"Documento","Telefone","DataNascimento") '
+                        'VALUES (%s,%s,%s,%s,%s,%s,%s)',
+                        (pessoa_id, NOME_TESTE, "", 0, CPF_TESTE, "", None))
+
+        cur.execute('INSERT INTO "Cliente" ("Id","PessoaId","LimiteCredito","Bloqueado",'
+                    '"DataCadastro","TabelaPrecoId") VALUES (%s,%s,%s,%s,%s,%s)',
+                    (cliente_id, pessoa_id, 0, False, datetime.now(), str(ID_TABELA)))
+    conn.commit()
+    print(f"Cliente de teste criado: {NOME_TESTE} | CPF {CPF_TESTE} | tabela {NOME_TABELA}")
+
+
+def remover_cliente_teste(conn):
+    with conn.cursor() as cur:
+        cur.execute('SELECT "Id" FROM "Pessoa" WHERE "Documento" = %s AND "Nome" = %s',
+                    (CPF_TESTE, NOME_TESTE))
+        achado = cur.fetchone()
+        if not achado:
+            print("Cliente de teste nao existe.")
+            return
+        pessoa_id = achado[0]
+        cur.execute('DELETE FROM "Cliente" WHERE "PessoaId" = %s', (pessoa_id,))
+        cur.execute('DELETE FROM "Pessoa" WHERE "Id" = %s', (pessoa_id,))
+    conn.commit()
+    print(f"Cliente de teste removido (CPF {CPF_TESTE}).")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Tabela de preco do clube no SIM")
     grupo = ap.add_mutually_exclusive_group(required=True)
     grupo.add_argument("--status", action="store_true")
     grupo.add_argument("--criar", action="store_true")
+    grupo.add_argument("--cliente-teste", action="store_true")
     grupo.add_argument("--desfazer", action="store_true")
     args = ap.parse_args()
 
@@ -166,8 +216,11 @@ def main():
             status(conn)
         elif args.criar:
             criar(conn)
+        elif args.cliente_teste:
+            criar_cliente_teste(conn)
         else:
             desfazer(conn)
+            remover_cliente_teste(conn)
     finally:
         conn.close()
 
