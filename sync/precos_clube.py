@@ -198,13 +198,34 @@ def sincronizar(dry_run=False):
             else:
                 ligados = desligados = 0
 
+            # 6) REGRA: fora das ofertas do site, o preco tem que ser igual ao
+            #    da tabela normal. Confere depois de gravar e avisa se algo
+            #    fugiu (ex.: alguem editou a tabela do clube na mao).
+            fora_da_regra = []
+            if not dry_run:
+                cur.execute('SELECT "ProdutoId"::text, "PrecoVenda" '
+                            'FROM "ProdutoTabelaPreco" WHERE "TabelaPrecoId" = %s',
+                            (id_clube,))
+                for pid, preco_atual in cur.fetchall():
+                    if pid in ofertas:
+                        continue
+                    normal_p = preco_normal.get(pid)
+                    if normal_p is None:
+                        continue
+                    if abs(float(preco_atual or 0) - normal_p) > 0.005:
+                        fora_da_regra.append(pid)
+
         if dry_run:
             sim.rollback()
         else:
             sim.commit()
         log(f"[precos] tabela={NOME_TABELA} ofertas={len(ofertas)} "
             f"precos_alterados={mudancas} clientes_ligados={ligados} "
-            f"desligados={desligados}" + (" (DRY-RUN)" if dry_run else ""))
+            f"desligados={desligados} fora_da_regra={len(fora_da_regra)}"
+            + (" (DRY-RUN)" if dry_run else ""))
+        if fora_da_regra:
+            log(f"[precos] ATENCAO: {len(fora_da_regra)} produto(s) sem oferta com "
+                f"preco diferente da tabela normal. O proximo sync corrige.")
         return mudancas
     except Exception:
         sim.rollback()
