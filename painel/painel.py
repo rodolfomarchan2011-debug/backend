@@ -382,7 +382,8 @@ def dados():
         saida = subprocess.run(
             ["schtasks", "/query", "/tn", "Clube Diana - Sync SIM", "/fo", "LIST"],
             capture_output=True, text=True, timeout=15,
-            encoding="oem", errors="ignore").stdout or ""
+            encoding="oem", errors="ignore",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout or ""
         proxima = ""
         for linha in saida.splitlines():
             if "xima" in linha and ":" in linha:
