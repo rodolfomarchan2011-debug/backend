@@ -92,8 +92,22 @@ DOCS_ATIVO = ENV.get("CLUBE_DOCS", "0").strip().lower() in ("1", "true", "sim")
 DB_POOL = max(2, int(ENV.get("CLUBE_DB_POOL", "8")))
 ORIGINS = [o.strip() for o in ENV.get(
     "CLUBE_ALLOWED_ORIGINS",
-    "https://clube-diana.onrender.com,http://localhost:5500,http://127.0.0.1:5500",
+    "https://clube-diana.onrender.com,"
+    "https://casadecarnesdiana.com.br,"
+    "https://www.casadecarnesdiana.com.br,"
+    "http://localhost:5500,http://127.0.0.1:5500",
 ).split(",") if o.strip()]
+
+# Regex: cobre o dominio proprio (com e sem www), o endereco antigo do
+# Render e o ambiente local. Se o dominio mudar de novo, o cadastro nao
+# quebra por causa do CORS.
+ORIGIN_REGEX = ENV.get(
+    "CLUBE_ALLOWED_ORIGIN_REGEX",
+    r"^https://(www\.)?casadecarnesdiana\.com\.br$"
+    r"|^https://clube-diana\.onrender\.com$"
+    r"|^http://localhost:5500$"
+    r"|^http://127\.0\.0\.1:5500$",
+)
 
 
 def db_url():
@@ -328,6 +342,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS,
+    allow_origin_regex=ORIGIN_REGEX,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
     allow_credentials=False,
