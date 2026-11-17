@@ -487,6 +487,333 @@ def abrir_backups():
         return {"ok": False, "mensagem": "Pasta de backups: " + BACKUP_DIR}
 
 
+
+# ---------------- resgates de brindes ----------------
+# Regra igual a da API: 1 ponto a cada R$ 2 pagos, validade 12 meses.
+PONTOS_POR_REAL = 0.5
+PONTOS_VALIDADE_MESES = 12
+
+
+def _so_digitos(valor):
+    return re.sub(r'[^0-9]', '', valor or '')
+
+
+def _pontos_cliente(cur, cliente_id):
+    cur.execute(
+        "SELECT COALESCE(SUM(FLOOR(total_liquido * %s)),0) AS p FROM compras "
+        "WHERE cliente_id=%s AND data_venda >= DATE_SUB(NOW(), INTERVAL %s MONTH)",
+        (PONTOS_POR_REAL, cliente_id, PONTOS_VALIDADE_MESES))
+    ganhos = int(cur.fetchone()["p"] or 0)
+    cur.execute("SELECT COALESCE(SUM(pontos),0) AS p FROM resgates "
+                "WHERE cliente_id=%s AND status <> 'cancelado'", (cliente_id,))
+    usados = int(cur.fetchone()["p"] or 0)
+    return ganhos, usados, max(0, ganhos - usados)
+
+
+class ResgateNovo(BaseModel):
+    cpf: str = ""
+    brinde_id: str = ""
+
+
+class ResgateEntrega(BaseModel):
+    codigo: str = ""
+
+
+@app.get("/api/resgates/lista")
+def resgates_lista():
+    cx = conn()
+    try:
+        with cx.cursor() as cur:
+            cur.execute("SELECT id, nome, valor, pontos FROM brindes WHERE ativo=1 "
+                        "ORDER BY ordem, pontos")
+            brindes = cur.fetchall()
+            cur.execute(
+                "SELECT r.codigo, r.brinde_nome, r.pontos, r.criado_em, "
+                "c.nome, c.cpf FROM resgates r LEFT JOIN clientes c ON c.id=r.cliente_id "
+                "WHERE r.status='pendente' ORDER BY r.criado_em")
+            pendentes = cur.fetchall()
+            cur.execute(
+                "SELECT r.codigo, r.brinde_nome, r.pontos, r.criado_em, r.entregue_em, "
+                "c.nome, c.cpf FROM resgates r LEFT JOIN clientes c ON c.id=r.cliente_id "
+                "WHERE r.status<>'pendente' ORDER BY r.entregue_em DESC LIMIT 100")
+            historico = cur.fetchall()
+    finally:
+        cx.close()
+
+    def formata(linhas):
+        saida = []
+        for r in linhas:
+            cpf = r.get("cpf") or ""
+            if len(cpf) == 11:
+                cpf = f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+            saida.append({
+                "codigo": r["codigo"], "brinde": r["brinde_nome"],
+                "pontos": int(r["pontos"]), "cliente": r.get("nome") or "—",
+                "cpf": cpf,
+                "criado_em": r["criado_em"].strftime("%d/%m/%Y %H:%M") if r.get("criado_em") else "",
+                "entregue_em": r["entregue_em"].strftime("%d/%m/%Y %H:%M") if r.get("entregue_em") else "",
+            })
+        return saida
+
+    return {
+        "brindes": [{"id": b["id"], "nome": b["nome"], "pontos": int(b["pontos"]),
+                     "valor": float(b["valor"])} for b in brindes],
+        "pendentes": formata(pendentes),
+        "historico": formata(historico),
+    }
+
+
+@app.post("/api/resgates/entregar")
+def resgate_entregar(dados: ResgateEntrega):
+    codigo = (dados.codigo or "").strip().upper()
+    if not codigo:
+        raise HTTPException(400, "Informe o codigo")
+    cx = conn()
+    try:
+        with cx.cursor() as cur:
+            cur.execute("UPDATE resgates SET status='entregue', entregue_em=NOW() "
+                        "WHERE codigo=%s AND status='pendente'", (codigo,))
+            if cur.rowcount == 0:
+                raise HTTPException(404, "Codigo nao encontrado ou ja entregue")
+    finally:
+        cx.close()
+    return {"ok": True, "codigo": codigo}
+
+
+@app.get("/api/resgates/saldo")
+def resgate_saldo(cpf: str = ""):
+    cpf = _so_digitos(cpf)
+    if len(cpf) != 11:
+        raise HTTPException(400, "CPF invalido")
+    cx = conn()
+    try:
+        with cx.cursor() as cur:
+            cur.execute("SELECT id, nome FROM clientes WHERE cpf=%s", (cpf,))
+            cliente = cur.fetchone()
+            if not cliente:
+                raise HTTPException(404, "Cliente nao encontrado no clube")
+            ganhos, usados, saldo = _pontos_cliente(cur, cliente["id"])
+    finally:
+        cx.close()
+    return {"nome": cliente["nome"], "saldo": saldo, "ganhos": ganhos, "usados": usados}
+
+
+@app.post("/api/resgates/novo")
+def resgate_novo(dados: ResgateNovo):
+    """Resgate feito no balcao, pelo caixa."""
+    cpf = _so_digitos(dados.cpf)
+    if len(cpf) != 11:
+        raise HTTPException(400, "CPF invalido")
+    cx = conn()
+    try:
+        with cx.cursor() as cur:
+            cur.execute("SELECT id, nome FROM clientes WHERE cpf=%s", (cpf,))
+            cliente = cur.fetchone()
+            if not cliente:
+                raise HTTPException(404, "Cliente nao encontrado no clube")
+            cur.execute("SELECT id, nome, pontos FROM brindes WHERE id=%s AND ativo=1",
+                        (dados.brinde_id,))
+            brinde = cur.fetchone()
+            if not brinde:
+                raise HTTPException(404, "Brinde indisponivel")
+            ganhos, usados, saldo = _pontos_cliente(cur, cliente["id"])
+            if saldo < int(brinde["pontos"]):
+                raise HTTPException(400, f"Saldo insuficiente: {saldo} pontos")
+            codigo = "DIA-" + secrets.token_hex(2).upper()
+            cur.execute(
+                "INSERT INTO resgates (id, cliente_id, brinde_id, brinde_nome, pontos, "
+                "status, codigo) VALUES (%s,%s,%s,%s,%s,'pendente',%s)",
+                (secrets.token_hex(12), cliente["id"], brinde["id"], brinde["nome"],
+                 int(brinde["pontos"]), codigo))
+    finally:
+        cx.close()
+    return {"ok": True, "codigo": codigo, "cliente": cliente["nome"],
+            "brinde": brinde["nome"], "saldo": saldo - int(brinde["pontos"])}
+
+
+HTML_RESGATES = r"""<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Resgates de brindes - Clube Diana</title>
+<style>
+:root{--marrom:#2b1d16;--vermelho:#a4161a;--dourado:#d4a017;--creme:#faf6ef;--linha:#e8ddcd;}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--creme);color:#241a14}
+header{background:var(--marrom);color:#fff;padding:14px 22px;display:flex;align-items:center;justify-content:space-between;gap:14px}
+header h1{margin:0;font-size:18px}
+header a{color:#f3d9a4;font-size:13px;text-decoration:none;font-weight:700}
+main{max-width:1000px;margin:0 auto;padding:22px 16px 60px}
+h2{font-size:15px;text-transform:uppercase;letter-spacing:.06em;color:#8a7b69;margin:26px 0 10px}
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--linha);border-radius:12px;overflow:hidden}
+th,td{padding:10px 12px;text-align:left;font-size:14px;border-bottom:1px solid var(--linha)}
+th{background:#f3ece0;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#8a7b69}
+tr:last-child td{border-bottom:0}
+.cod{font-weight:800;letter-spacing:.04em;color:var(--vermelho)}
+.vazio{padding:18px;color:#8a7b69;font-size:14px;background:#fff;border:1px solid var(--linha);border-radius:12px}
+button{font:inherit;font-weight:700;padding:8px 14px;border:0;border-radius:9px;background:var(--vermelho);color:#fff;cursor:pointer}
+button:hover{background:#8d1214}
+button.sec{background:#fff;color:#241a14;border:1px solid var(--linha)}
+input,select{font:inherit;padding:10px 12px;border:1px solid var(--linha);border-radius:9px;background:#fff;width:100%}
+.linha{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end}
+.card{background:#fff;border:1px solid var(--linha);border-radius:14px;padding:16px}
+#msg{margin-top:14px;font-size:15px;font-weight:600}
+.ok{color:#1b5e20}.erro{color:#8d1214}
+.saldo{font-size:14px;color:#8a7b69;margin-top:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Resgates de brindes &middot; Clube Diana</h1>
+  <a href="/">&#8592; Voltar ao painel</a>
+</header>
+<main>
+  <h2>Resgatar no balc&atilde;o</h2>
+  <div class="card">
+    <div class="linha">
+      <label>CPF do cliente<input id="cpf" inputmode="numeric" placeholder="000.000.000-00" maxlength="14"></label>
+      <label>Brinde<select id="brinde"></select></label>
+      <button id="btn-novo">Resgatar</button>
+    </div>
+    <div class="saldo" id="saldo">Digite o CPF para ver o saldo.</div>
+    <div id="msg"></div>
+  </div>
+
+  <h2>Pendentes (mostrar no caixa)</h2>
+  <div id="pendentes"></div>
+
+  <h2>Hist&oacute;rico</h2>
+  <div id="historico"></div>
+</main>
+<script>
+var dados = {brindes: [], pendentes: [], historico: []};
+
+function el(tag, txt, cls) {
+  var e = document.createElement(tag);
+  if (txt !== undefined) e.textContent = txt;
+  if (cls) e.className = cls;
+  return e;
+}
+
+function tabela(linhas, comBotao) {
+  if (!linhas.length) return el("div", "Nada por aqui.", "vazio");
+  var t = el("table");
+  var thead = el("thead");
+  var tr = el("tr");
+  ["Codigo", "Brinde", "Pontos", "Cliente", "CPF", "Data"].forEach(function (h) {
+    tr.appendChild(el("th", h));
+  });
+  if (comBotao) tr.appendChild(el("th", ""));
+  thead.appendChild(tr);
+  t.appendChild(thead);
+  var tb = el("tbody");
+  linhas.forEach(function (r) {
+    var linha = el("tr");
+    linha.appendChild(el("td", r.codigo, "cod"));
+    linha.appendChild(el("td", r.brinde));
+    linha.appendChild(el("td", String(r.pontos)));
+    linha.appendChild(el("td", r.cliente));
+    linha.appendChild(el("td", r.cpf));
+    linha.appendChild(el("td", comBotao ? r.criado_em : r.entregue_em));
+    if (comBotao) {
+      var td = el("td");
+      var b = el("button", "Entregue");
+      b.addEventListener("click", function () { entregar(r.codigo); });
+      td.appendChild(b);
+      linha.appendChild(td);
+    }
+    tb.appendChild(linha);
+  });
+  t.appendChild(tb);
+  return t;
+}
+
+function carregar() {
+  fetch("/api/resgates/lista").then(function (r) { return r.json(); }).then(function (d) {
+    dados = d;
+    var sel = document.getElementById("brinde");
+    sel.innerHTML = "";
+    d.brindes.forEach(function (b) {
+      var o = el("option", b.nome + " (" + b.pontos + " pts)");
+      o.value = b.id;
+      sel.appendChild(o);
+    });
+    var p = document.getElementById("pendentes");
+    p.innerHTML = "";
+    p.appendChild(tabela(d.pendentes, true));
+    var h = document.getElementById("historico");
+    h.innerHTML = "";
+    h.appendChild(tabela(d.historico, false));
+  });
+}
+
+function mensagem(txt, erro) {
+  var m = document.getElementById("msg");
+  m.textContent = txt;
+  m.className = erro ? "erro" : "ok";
+}
+
+function entregar(codigo) {
+  fetch("/api/resgates/entregar", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({codigo: codigo})
+  }).then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+    .then(function (res) {
+      mensagem(res.ok ? "Resgate " + codigo + " entregue." : (res.j.detail || "Erro"), !res.ok);
+      carregar();
+    });
+}
+
+function consultarSaldo() {
+  var cpf = document.getElementById("cpf").value.replace(/\D/g, "");
+  if (cpf.length !== 11) { document.getElementById("saldo").textContent = "CPF incompleto."; return; }
+  fetch("/api/resgates/saldo?cpf=" + cpf).then(function (r) {
+    return r.json().then(function (j) { return {ok: r.ok, j: j}; });
+  }).then(function (res) {
+    document.getElementById("saldo").textContent = res.ok
+      ? res.j.nome + " tem " + res.j.saldo + " pontos (ganhou " + res.j.ganhos + ", usou " + res.j.usados + ")."
+      : (res.j.detail || "Cliente nao encontrado.");
+  });
+}
+
+document.getElementById("cpf").addEventListener("blur", consultarSaldo);
+
+document.getElementById("btn-novo").addEventListener("click", function () {
+  var cpf = document.getElementById("cpf").value.replace(/\D/g, "");
+  var brinde = document.getElementById("brinde").value;
+  if (cpf.length !== 11) { mensagem("Informe o CPF completo.", true); return; }
+  this.disabled = true;
+  var self = this;
+  fetch("/api/resgates/novo", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({cpf: cpf, brinde_id: brinde})
+  }).then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+    .then(function (res) {
+      self.disabled = false;
+      if (res.ok) {
+        mensagem("Resgate criado para " + res.j.cliente + ": " + res.j.brinde +
+                 " - codigo " + res.j.codigo + " (saldo " + res.j.saldo + ").");
+        document.getElementById("cpf").value = "";
+        document.getElementById("saldo").textContent = "Digite o CPF para ver o saldo.";
+        carregar();
+      } else {
+        mensagem(res.j.detail || "Nao foi possivel resgatar.", true);
+      }
+    });
+});
+
+carregar();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/resgates", response_class=HTMLResponse)
+def resgates_pagina():
+    return HTML_RESGATES
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return HTML
@@ -1124,6 +1451,7 @@ HTML = """<!doctype html>
   <div style="font-size:12px;opacity:.8">
     <a href="/cadastro" style="color:#f3d9a4;font-weight:700;text-decoration:none;
        background:rgba(255,255,255,.12);padding:8px 12px;border-radius:9px">Cadastro rapido no caixa</a>
+&nbsp; <a href="/resgates" style="color:#f3d9a4;font-weight:700;text-decoration:none;background:rgba(255,255,255,.12);padding:8px 12px;border-radius:9px">Resgates de brindes</a>
     &nbsp; roda so neste computador
   </div>
 </header>

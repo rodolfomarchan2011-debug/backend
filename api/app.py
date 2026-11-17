@@ -1,4 +1,4 @@
-"""API do Clube Diana.
+﻿"""API do Clube Diana.
 
 Responsabilidades:
   - cadastro/login do cliente (CPF + senha)
@@ -235,8 +235,8 @@ def cpf_valido(cpf: str) -> bool:
     return True
 
 
-def token(cliente_id: str) -> str:
-    exp = datetime.now(timezone.utc) + timedelta(hours=TOKEN_HOURS)
+def token(cliente_id: str, horas: int | None = None) -> str:
+    exp = datetime.now(timezone.utc) + timedelta(hours=horas or TOKEN_HOURS)
     return jwt.encode({"sub": cliente_id, "exp": exp},
                       JWT_SECRET, algorithm="HS256")
 
@@ -316,6 +316,7 @@ class Cadastro(BaseModel):
 class Login(BaseModel):
     cpf: str
     senha: str
+    lembrar: bool = False
 
 
 class Exclusao(BaseModel):
@@ -551,7 +552,7 @@ def login(body: Login, request: Request):
         raise HTTPException(401, "CPF ou senha incorretos")
     if row.get("excluido_em"):
         raise HTTPException(403, "Esta conta foi excluida. Fale com a loja para voltar ao clube.")
-    return {"ok": True, "token": token(row["id"]),
+    return {"ok": True, "token": token(row["id"], horas=(24 * 180) if body.lembrar else None),
             "cliente": {"nome": row["nome"], "cpf": row["cpf"]}}
 
 
