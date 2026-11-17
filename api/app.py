@@ -332,6 +332,10 @@ class Descadastro(BaseModel):
     token: str
 
 
+class Resgate(BaseModel):
+    brinde_id: str
+
+
 app = FastAPI(
     title="Clube Diana API",
     version="1.5.0",
@@ -575,6 +579,120 @@ def _filtro(where, params, d, a):
         where += " AND data_venda < DATE_ADD(%s, INTERVAL 1 DAY)"
         params.append(a)
     return where, params
+
+
+# ---------------- pontos e brindes ----------------
+# Regra interna: 1 ponto a cada R$ 2 pagos (0,5 ponto por real).
+# O cliente NAO ve essa taxa em lugar nenhum: so o saldo e o custo de cada brinde.
+PONTOS_POR_REAL = 0.5
+PONTOS_VALIDADE_MESES = 12
+
+
+def _pontos_ganhos(cur, cliente_id):
+    cur.execute(
+        "SELECT COALESCE(SUM(FLOOR(total_liquido * %s)),0) AS p FROM compras "
+        "WHERE cliente_id=%s AND data_venda >= DATE_SUB(NOW(), INTERVAL %s MONTH)",
+        (PONTOS_POR_REAL, cliente_id, PONTOS_VALIDADE_MESES))
+    return int(cur.fetchone()["p"] or 0)
+
+
+def _pontos_usados(cur, cliente_id):
+    cur.execute(
+        "SELECT COALESCE(SUM(pontos),0) AS p FROM resgates "
+        "WHERE cliente_id=%s AND status <> 'cancelado'", (cliente_id,))
+    return int(cur.fetchone()["p"] or 0)
+
+
+@app.get("/api/pontos")
+def meus_pontos(user=Depends(atual)):
+    """Saldo de pontos e catalogo de brindes (so para quem esta logado)."""
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            ganhos = _pontos_ganhos(cur, user["id"])
+            usados = _pontos_usados(cur, user["id"])
+            cur.execute("SELECT id, nome, valor, pontos FROM brindes "
+                        "WHERE ativo=1 ORDER BY ordem, pontos")
+            brindes = cur.fetchall()
+    finally:
+        conn.close()
+
+    saldo = max(0, ganhos - usados)
+    return {
+        "saldo": saldo,
+        "ganhos": ganhos,
+        "usados": usados,
+        "brindes": [
+            {"id": b["id"], "nome": b["nome"],
+             "valor": float(b["valor"]), "pontos": int(b["pontos"]),
+             "alcanca": saldo >= int(b["pontos"])}
+            for b in brindes
+        ],
+    }
+
+
+@app.get("/api/pontos/resgates")
+def meus_resgates(user=Depends(atual)):
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT brinde_nome, pontos, status, codigo, criado_em, entregue_em "
+                "FROM resgates WHERE cliente_id=%s ORDER BY criado_em DESC LIMIT 30",
+                (user["id"],))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    for r in rows:
+        r["criado_em"] = r["criado_em"].strftime("%d/%m/%Y %H:%M") if r["criado_em"] else None
+        r["entregue_em"] = r["entregue_em"].strftime("%d/%m/%Y %H:%M") if r["entregue_em"] else None
+    return {"resgates": rows}
+
+
+@app.post("/api/pontos/resgatar")
+def resgatar(dados: Resgate, user=Depends(atual)):
+    """Troca pontos por um brinde. O cliente recebe um codigo para mostrar no caixa."""
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, nome, pontos FROM brindes WHERE id=%s AND ativo=1",
+                        (dados.brinde_id,))
+            brinde = cur.fetchone()
+            if not brinde:
+                raise HTTPException(404, "Brinde indisponivel")
+
+            ganhos = _pontos_ganhos(cur, user["id"])
+            usados = _pontos_usados(cur, user["id"])
+            saldo = max(0, ganhos - usados)
+            custo = int(brinde["pontos"])
+            if saldo < custo:
+                raise HTTPException(400, f"Faltam {custo - saldo} pontos para este brinde")
+
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM resgates "
+                "WHERE cliente_id=%s AND brinde_id=%s AND status='pendente'",
+                (user["id"], brinde["id"]))
+            if int(cur.fetchone()["n"] or 0) > 0:
+                raise HTTPException(409, "Voce ja tem este brinde para retirar")
+
+            codigo = "DIA-" + secrets.token_hex(2).upper()
+            rid = secrets.token_hex(12)
+            cur.execute(
+                "INSERT INTO resgates (id, cliente_id, brinde_id, brinde_nome, pontos, "
+                "status, codigo) VALUES (%s,%s,%s,%s,%s,'pendente',%s)",
+                (rid, user["id"], brinde["id"], brinde["nome"], custo, codigo))
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "codigo": codigo,
+        "brinde": brinde["nome"],
+        "pontos": custo,
+        "saldo": saldo - custo,
+        "aviso": "Mostre este codigo no caixa para retirar o brinde.",
+    }
 
 
 @app.get("/api/me/compras")
