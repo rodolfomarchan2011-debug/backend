@@ -538,6 +538,17 @@ def pull_compras(env, dry_run, dias):
             except ValueError:
                 pass
 
+        # Piso opcional: nenhuma venda anterior a esta data entra no clube.
+        # Permite "comecar do zero" mesmo que a venda de teste continue no SIM.
+        piso = (env or {}).get("COMPRAS_DESDE")
+        if piso:
+            try:
+                piso_dt = datetime.fromisoformat(str(piso).strip())
+                if since < piso_dt:
+                    since = piso_dt
+            except ValueError:
+                log("[pull] COMPRAS_DESDE invalido (use AAAA-MM-DD); ignorado.")
+
         sql = """
             SELECT v."Id" AS venda_id, v."LancamentoId" AS lanc_id,
                    l."DataLancamento" AS data_venda,

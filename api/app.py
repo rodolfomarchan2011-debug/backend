@@ -521,8 +521,8 @@ def register(body: Cadastro, request: Request):
             try:
                 cur.execute(
                     "INSERT INTO clientes (id,nome,cpf,telefone,data_nascimento,senha_hash,"
-                    "aceite_lgpd,aceite_em,aceite_versao,sync_status) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,NOW(),%s,'pendente')",
+                    "aceite_lgpd,aceite_em,aceite_versao,origem,sync_status) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,NOW(),%s,'site','pendente')",
                     (cid, nome, cpf, telefone or None,
                      nasc, hash_senha(body.senha), 1, VERSAO_POLITICA))
             except pymysql.err.IntegrityError:

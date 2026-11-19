@@ -99,6 +99,20 @@ def sim_conn():
     return conn
 
 
+# Data em que o clube passou a valer. Vendas antes disso nao entram nos
+# relatorios (eram testes/simulacoes no PDV).
+def _piso_compras():
+    bruto = (ENV.get("COMPRAS_DESDE") or "").strip()
+    if not bruto:
+        return datetime(2000, 1, 1)
+    try:
+        return datetime.fromisoformat(bruto)
+    except ValueError:
+        return datetime(2000, 1, 1)
+
+
+PISO_COMPRAS = _piso_compras()
+
 SQL_ADESAO = """
 WITH base AS (
   SELECT l."DataLancamento" AS dt,
@@ -110,7 +124,7 @@ WITH base AS (
   JOIN "Lancamento" l ON l."Id" = v."LancamentoId"
   LEFT JOIN "Cliente" c ON c."Id" = v."ClienteId"
   LEFT JOIN "Pessoa" p ON p."Id" = c."PessoaId"
-  WHERE l."DataLancamento" >= now() - make_interval(days => %s)
+  WHERE l."DataLancamento" >= GREATEST(now() - make_interval(days => %s), %s::timestamp)
 )
 SELECT to_char(dt::date, 'DD/MM') AS dia,
        count(*) AS vendas,
@@ -165,7 +179,7 @@ def adesao(dias: int = 7):
         return {"ok": False, "erro": erro.detail}
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(SQL_ADESAO, (dias,))
+            cur.execute(SQL_ADESAO, (dias, PISO_COMPRAS))
             linhas = cur.fetchall()
     except Exception as exc:
         return {"ok": False, "erro": type(exc).__name__}
@@ -184,7 +198,7 @@ def adesao(dias: int = 7):
 
 
 SQL_ADESAO_MES = SQL_ADESAO.replace(
-    'WHERE l."DataLancamento" >= now() - make_interval(days => %s)',
+    'WHERE l."DataLancamento" >= GREATEST(now() - make_interval(days => %s), %s::timestamp)',
     'WHERE l."DataLancamento" >= %s AND l."DataLancamento" < %s'
 ).replace(
     """SELECT to_char(dt::date, 'DD/MM') AS dia,
@@ -217,6 +231,8 @@ def relatorio(mes: str | None = None):
     """Numeros do mes: clientes, compras, economia, top clientes e adesao."""
     referencia = mes or datetime.now().strftime("%Y-%m")
     inicio, fim = _mes(referencia)
+    if inicio < PISO_COMPRAS:
+        inicio = PISO_COMPRAS
 
     db = conn()
     try:
@@ -350,7 +366,7 @@ def dados():
             cur.execute("SELECT sync_status, COUNT(*) AS n FROM clientes GROUP BY sync_status")
             contagem = {r["sync_status"]: r["n"] for r in cur.fetchall()}
             cur.execute(
-                "SELECT id,nome,cpf,telefone,sync_status,sync_erro,sync_tentativas,"
+                "SELECT id,nome,cpf,telefone,origem,sync_status,sync_erro,sync_tentativas,"
                 "criado_em,last_synced_at,sim_pessoa_id,sim_cliente_id "
                 "FROM clientes ORDER BY criado_em DESC LIMIT 200")
             clientes = cur.fetchall()
@@ -877,8 +893,8 @@ def cadastro_rapido(body: CadastroRapido):
             cid = str(uuid.uuid4())
             cur.execute(
                 "INSERT INTO clientes (id,nome,cpf,telefone,data_nascimento,senha_hash,"
-                "aceite_lgpd,aceite_em,aceite_versao,sync_status) "
-                "VALUES (%s,%s,%s,%s,%s,%s,1,NOW(),%s,'pendente')",
+                "aceite_lgpd,aceite_em,aceite_versao,origem,sync_status) "
+                "VALUES (%s,%s,%s,%s,%s,%s,1,NOW(),%s,'painel','pendente')",
                 (cid, nome, cpf, tel, nasc,
                  _hash_senha(secrets.token_urlsafe(24)), "caixa"))
     finally:
@@ -1364,6 +1380,14 @@ HTML = """<!doctype html>
   button.principal:hover{background:#8d1214}
   button.mini{padding:5px 9px;font-size:12px;border-radius:8px}
   .alerta{background:#fdecea;border:1px solid #f5c2c0;color:#8d1214;padding:14px 16px;border-radius:12px;margin-bottom:16px;white-space:pre-wrap}
+  .filtros{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0 10px}
+  .filtros input,.filtros select{font:inherit;padding:10px 12px;border:1px solid var(--linha,#e8ddcd);border-radius:10px;background:#fff}
+  .filtros input{flex:1 1 260px;min-width:220px}
+  .filtros button{background:#fff;color:#241a14;border:1px solid var(--linha,#e8ddcd);border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
+  .filtros button:hover{background:#f3ece0}
+  .contagem{font-size:13px;color:#7a6b59;font-weight:600}
+  .tag.origem-site{background:#e8f0fe;color:#1a4b8c;border:1px solid #c7dbf7}
+  .tag.origem-painel{background:#fff4e5;color:#8a5a00;border:1px solid #f5d9a8}
   table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--linha);border-radius:12px;overflow:hidden}
   th,td{padding:10px 12px;text-align:left;font-size:13px;border-bottom:1px solid var(--linha);vertical-align:top}
   th{background:#f6efe3;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#7a6b59}
@@ -1474,11 +1498,22 @@ HTML = """<!doctype html>
 
   <div id="saida" class="oculto"><pre id="saida-txt"></pre></div>
 
+  <div class="filtros">
+    <input id="f-busca" type="search" placeholder="Filtrar por nome ou CPF">
+    <select id="f-origem">
+      <option value="">Todas as origens</option>
+      <option value="site">Cadastro pelo site</option>
+      <option value="painel">Cadastro no caixa</option>
+    </select>
+    <button id="f-limpar" type="button">Limpar</button>
+    <span id="f-contagem" class="contagem"></span>
+  </div>
+
   <table>
     <thead>
-      <tr><th>Cliente</th><th>CPF</th><th>Situacao</th><th>Detalhe</th><th>Acoes</th></tr>
+      <tr><th>Cliente</th><th>CPF</th><th>Telefone</th><th>Origem</th><th>Situacao</th><th>Detalhe</th><th>Acoes</th></tr>
     </thead>
-    <tbody id="linhas"><tr><td colspan="5">carregando...</td></tr></tbody>
+    <tbody id="linhas"><tr><td colspan="7">carregando...</td></tr></tbody>
   </table>
 
   <h2 class="secao">Ofertas do site</h2>
@@ -1607,9 +1642,87 @@ HTML = """<!doctype html>
 var atual = null;
 var $ = function (id) { return document.getElementById(id); };
 
+function telFmt(v) {
+  var d = String(v || "").replace(/\D/g, "");
+  if (d.length === 11) return "(" + d.substr(0, 2) + ") " + d.substr(2, 5) + "-" + d.substr(7);
+  if (d.length === 10) return "(" + d.substr(0, 2) + ") " + d.substr(2, 4) + "-" + d.substr(6);
+  return d ? v : "-";
+}
+
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+  });
+}
+
+var TODOS_CLIENTES = [];
+
+function origemRotulo(o) {
+  if (o === "painel") return "caixa";
+  if (o === "site") return "site";
+  return "-";
+}
+
+function aplicarFiltro() {
+  var t = $("linhas");
+  var busca = ($("f-busca").value || "").toLowerCase().trim();
+  var origem = $("f-origem").value;
+
+  var soDigitos = busca.replace(/\D/g, "");
+  var lista = TODOS_CLIENTES.filter(function (c) {
+    if (origem && c.origem !== origem) return false;
+    if (!busca) return true;
+    var nome = (c.nome || "").toLowerCase();
+    if (nome.indexOf(busca) !== -1) return true;
+    if (soDigitos && String(c.cpf || "").replace(/\D/g, "").indexOf(soDigitos) !== -1) return true;
+    return false;
+  });
+
+  var totalSite = TODOS_CLIENTES.filter(function (c) { return c.origem === "site"; }).length;
+  var totalCaixa = TODOS_CLIENTES.filter(function (c) { return c.origem === "painel"; }).length;
+  $("f-contagem").textContent = lista.length + " de " + TODOS_CLIENTES.length +
+    " cadastros (site: " + totalSite + " | caixa: " + totalCaixa + ")";
+
+  if (!lista.length) {
+    t.innerHTML = "<tr><td colspan='7'>Nenhum cadastro com esse filtro.</td></tr>";
+    return;
+  }
+
+  t.innerHTML = lista.map(function (c) {
+    var det = c.sync_erro ? esc(c.sync_erro)
+      : (c.vinculado ? "vinculado ao PDV"
+      : (c.sync_status === "pendente" ? "aguardando envio" : ""));
+    return "<tr>" +
+      "<td><strong>" + esc(c.nome) + "</strong><br><span style='font-size:11px;color:#8a7b69'>" +
+        esc(c.criado_em) + "</span></td>" +
+      "<td>" + esc(c.cpf) + "</td>" +
+      "<td>" + esc(telFmt(c.telefone)) + "</td>" +
+      "<td><span class='tag origem-" + esc(c.origem || "site") + "'>" +
+        esc(origemRotulo(c.origem)) + "</span></td>" +
+      "<td><span class='tag " + esc(c.sync_status) + "'>" + esc(c.sync_status) + "</span>" +
+        (c.sync_tentativas ? "<br><span style='font-size:11px;color:#8a7b69'>tentativas: " +
+          c.sync_tentativas + "</span>" : "") + "</td>" +
+      "<td class='detalhe'>" + det + "</td>" +
+      "<td><div class='acoes'>" +
+        "<button class='mini' data-acao='reenviar' data-id='" + esc(c.id) + "'>Reenviar</button>" +
+        "<button class='mini' data-acao='cpf' data-id='" + esc(c.id) +
+          "' data-nome='" + esc(c.nome) + "' data-cpf='" + esc(c.cpf) + "'>Corrigir CPF</button>" +
+      "</div></td>" +
+    "</tr>";
+  }).join("");
+}
+
+function ligarFiltros() {
+  var busca = $("f-busca");
+  var origem = $("f-origem");
+  if (!busca || busca.dataset.ligado) return;
+  busca.dataset.ligado = "1";
+  busca.addEventListener("input", aplicarFiltro);
+  origem.addEventListener("change", aplicarFiltro);
+  $("f-limpar").addEventListener("click", function () {
+    busca.value = "";
+    origem.value = "";
+    aplicarFiltro();
   });
 }
 
@@ -1636,30 +1749,8 @@ function carregar() {
     $("f-ultima").textContent = "ultima execucao: " + (d.ultima_execucao || "nunca");
     $("f-backup").textContent = "backup: " + (d.backup.ultimo || "nenhum ainda");
 
-    var t = $("linhas");
-    if (!d.clientes.length) {
-      t.innerHTML = "<tr><td colspan='5'>Nenhum cadastro ainda.</td></tr>";
-      return;
-    }
-    t.innerHTML = d.clientes.map(function (c) {
-      var det = c.sync_erro ? esc(c.sync_erro)
-        : (c.vinculado ? "vinculado ao PDV"
-        : (c.sync_status === "pendente" ? "aguardando envio" : ""));
-      return "<tr>" +
-        "<td><strong>" + esc(c.nome) + "</strong><br><span style='font-size:11px;color:#8a7b69'>" +
-          esc(c.criado_em) + "</span></td>" +
-        "<td>" + esc(c.cpf) + "</td>" +
-        "<td><span class='tag " + esc(c.sync_status) + "'>" + esc(c.sync_status) + "</span>" +
-          (c.sync_tentativas ? "<br><span style='font-size:11px;color:#8a7b69'>tentativas: " +
-            c.sync_tentativas + "</span>" : "") + "</td>" +
-        "<td class='detalhe'>" + det + "</td>" +
-        "<td><div class='acoes'>" +
-          "<button class='mini' data-acao='reenviar' data-id='" + esc(c.id) + "'>Reenviar</button>" +
-          "<button class='mini' data-acao='cpf' data-id='" + esc(c.id) +
-            "' data-nome='" + esc(c.nome) + "' data-cpf='" + esc(c.cpf) + "'>Corrigir CPF</button>" +
-        "</div></td>" +
-      "</tr>";
-    }).join("");
+    TODOS_CLIENTES = d.clientes;
+    aplicarFiltro();
   }).catch(function (e) {
     $("atualizado").textContent = "sem conexao com o banco: " + e;
   });
@@ -2183,6 +2274,7 @@ $("btn-ver-site").addEventListener("click", function () {
 carregarOfertas();
 
 carregarRelatorio();
+ligarFiltros();
 carregar();
 carregarAdesao();
 setInterval(carregar, 30000);
